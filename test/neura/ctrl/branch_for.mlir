@@ -84,7 +84,7 @@ func.func @loop_test() -> f32 {
 // CHECK-NEXT:   "neura.return"(%10) : (!neura.data<f32, i1>) -> ()
 // CHECK-NEXT: }
 
-// CANONICALIZE:       func.func @loop_test() -> f32 attributes {accelerator = "neura"} {
+// CANONICALIZE:     func.func @loop_test() -> f32 attributes {accelerator = "neura"} {
 // CANONICALIZE-NEXT:     %0 = "neura.constant"() <{predicate = true, value = 10 : i64}> : () -> !neura.data<i64, i1>
 // CANONICALIZE-NEXT:     %1 = "neura.constant"() <{predicate = true, value = 0 : i64}> : () -> !neura.data<i64, i1>
 // CANONICALIZE-NEXT:     %2 = "neura.constant"() <{predicate = true, value = 1 : i64}> : () -> !neura.data<i64, i1>
@@ -207,7 +207,7 @@ func.func @loop_test() -> f32 {
 // MOV-NEXT:     %59 = "neura.data_mov"(%58) : (!neura.data<f32, i1>) -> !neura.data<f32, i1>
 // MOV-NEXT:     "neura.return"(%59) : (!neura.data<f32, i1>) -> ()
 
-// MAPPING:   func.func @loop_test() -> f32 attributes {CompiledII = 6 : i32, RecMII = 4 : i32, ResMII = 2 : i32, accelerator = "neura"} {
+// MAPPING:     func.func @loop_test() -> f32 attributes {CompiledII = 6 : i32, RecMII = 4 : i32, ResMII = 2 : i32, accelerator = "neura"} {
 // MAPPING-NEXT:     %0 = "neura.constant"() <{predicate = true, value = 10 : i64}> {mapping_locs = [{id = 10 : i32, resource = "tile", time_step = 0 : i32, x = 2 : i32, y = 2 : i32}]} : () -> !neura.data<i64, i1>
 // MAPPING-NEXT:     %1 = "neura.data_mov"(%0) {mapping_locs = []} : (!neura.data<i64, i1>) -> !neura.data<i64, i1>
 // MAPPING-NEXT:     %2 = "neura.grant_once"(%1) {mapping_locs = [{id = 10 : i32, resource = "tile", time_step = 1 : i32, x = 2 : i32, y = 2 : i32}]} : (!neura.data<i64, i1>) -> !neura.data<i64, i1>
