@@ -18,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::taskflow;
@@ -28,6 +29,7 @@ struct CgraUse {
   int row = 0;
   int col = 0;
   int context_id = 0;
+  int replica_id = 0;
 };
 
 struct VisualTask {
@@ -49,6 +51,14 @@ struct Lane {
   int row = 0;
   int col = 0;
   std::string label;
+};
+
+struct TaskBlock {
+  int replica_id = 0;
+  int top_lane = 0;
+  int bottom_lane = 0;
+  int y = 0;
+  int height = 0;
 };
 
 static std::string getTaskName(TaskflowTaskOp task) {
@@ -131,6 +141,7 @@ static SmallVector<CgraUse> parseCgraUses(TaskflowTaskOp task) {
     cgra_use.row = getDictionaryIntegerAttr(coord, "row", 0);
     cgra_use.col = getDictionaryIntegerAttr(coord, "col", 0);
     cgra_use.context_id = getDictionaryIntegerAttr(coord, "context_id", 0);
+    cgra_use.replica_id = getDictionaryIntegerAttr(coord, "replica_id", 0);
     cgra_uses.push_back(cgra_use);
   }
   return cgra_uses;
@@ -351,6 +362,165 @@ static int getTaskBottomLane(const VisualTask &task, ArrayRef<Lane> lanes) {
   return bottom_lane;
 }
 
+static SmallVector<int> collectTaskReplicaIds(const VisualTask &task) {
+  SmallVector<int> replica_ids;
+  DenseSet<int> seen_replica_ids;
+  if (task.cgra_uses.empty()) {
+    replica_ids.push_back(0);
+    return replica_ids;
+  }
+
+  for (const CgraUse &cgra_use : task.cgra_uses) {
+    if (seen_replica_ids.insert(cgra_use.replica_id).second) {
+      replica_ids.push_back(cgra_use.replica_id);
+    }
+  }
+  llvm::sort(replica_ids);
+  return replica_ids;
+}
+
+static std::pair<int, int>
+getTaskLaneRangeForReplica(const VisualTask &task, ArrayRef<Lane> lanes,
+                           int replica_id) {
+  int top_lane = std::numeric_limits<int>::max();
+  int bottom_lane = 0;
+  for (const CgraUse &cgra_use : task.cgra_uses) {
+    if (cgra_use.replica_id != replica_id) {
+      continue;
+    }
+    int lane = findLaneIndex(lanes, cgra_use.row, cgra_use.col);
+    if (lane < 0) {
+      continue;
+    }
+    top_lane = std::min(top_lane, lane);
+    bottom_lane = std::max(bottom_lane, lane);
+  }
+
+  if (top_lane == std::numeric_limits<int>::max()) {
+    return {0, 0};
+  }
+  return {top_lane, bottom_lane};
+}
+
+static TaskBlock buildTaskBlock(const VisualTask &task, ArrayRef<Lane> lanes,
+                                int replica_id, int top_margin,
+                                int lane_height, int task_height) {
+  auto [top_lane, bottom_lane] =
+      getTaskLaneRangeForReplica(task, lanes, replica_id);
+  TaskBlock block;
+  block.replica_id = replica_id;
+  block.top_lane = top_lane;
+  block.bottom_lane = bottom_lane;
+  block.y = top_margin + top_lane * lane_height + 12;
+  block.height = task_height + (bottom_lane - top_lane) * lane_height;
+  return block;
+}
+
+static TaskBlock buildTaskBlockFromLaneRange(int replica_id, int top_lane,
+                                             int bottom_lane, int top_margin,
+                                             int lane_height,
+                                             int task_height) {
+  TaskBlock block;
+  block.replica_id = replica_id;
+  block.top_lane = top_lane;
+  block.bottom_lane = bottom_lane;
+  block.y = top_margin + top_lane * lane_height + 12;
+  block.height = task_height + (bottom_lane - top_lane) * lane_height;
+  return block;
+}
+
+static SmallVector<int> collectTaskLanesForReplica(const VisualTask &task,
+                                                   ArrayRef<Lane> lanes,
+                                                   int replica_id) {
+  SmallVector<int> task_lanes;
+  DenseSet<int> seen_lanes;
+  for (const CgraUse &cgra_use : task.cgra_uses) {
+    if (cgra_use.replica_id != replica_id) {
+      continue;
+    }
+    int lane = findLaneIndex(lanes, cgra_use.row, cgra_use.col);
+    if (lane >= 0 && seen_lanes.insert(lane).second) {
+      task_lanes.push_back(lane);
+    }
+  }
+  llvm::sort(task_lanes);
+  return task_lanes;
+}
+
+static SmallVector<TaskBlock> buildTaskBlocks(const VisualTask &task,
+                                              ArrayRef<Lane> lanes,
+                                              int top_margin,
+                                              int lane_height,
+                                              int task_height) {
+  SmallVector<TaskBlock> blocks;
+  for (int replica_id : collectTaskReplicaIds(task)) {
+    SmallVector<int> task_lanes =
+        collectTaskLanesForReplica(task, lanes, replica_id);
+    if (task_lanes.empty()) {
+      blocks.push_back(buildTaskBlock(task, lanes, replica_id, top_margin,
+                                      lane_height, task_height));
+      continue;
+    }
+
+    int run_start = task_lanes.front();
+    int run_end = run_start;
+    for (size_t i = 1; i < task_lanes.size(); ++i) {
+      int lane = task_lanes[i];
+      if (lane == run_end + 1) {
+        run_end = lane;
+        continue;
+      }
+
+      blocks.push_back(buildTaskBlockFromLaneRange(
+          replica_id, run_start, run_end, top_margin, lane_height,
+          task_height));
+      run_start = lane;
+      run_end = lane;
+    }
+    blocks.push_back(buildTaskBlockFromLaneRange(
+        replica_id, run_start, run_end, top_margin, lane_height, task_height));
+  }
+  return blocks;
+}
+
+static TaskBlock buildTaskOverallBlock(const VisualTask &task,
+                                       ArrayRef<Lane> lanes, int top_margin,
+                                       int lane_height, int task_height) {
+  int top_lane = getTaskTopLane(task, lanes);
+  int bottom_lane = getTaskBottomLane(task, lanes);
+  TaskBlock block;
+  block.replica_id = 0;
+  block.top_lane = top_lane;
+  block.bottom_lane = bottom_lane;
+  block.y = top_margin + top_lane * lane_height + 12;
+  block.height = task_height + (bottom_lane - top_lane) * lane_height;
+  return block;
+}
+
+static TaskBlock getIncomingAnchorBlock(const VisualTask &task,
+                                        ArrayRef<Lane> lanes, int top_margin,
+                                        int lane_height, int task_height) {
+  SmallVector<TaskBlock> blocks =
+      buildTaskBlocks(task, lanes, top_margin, lane_height, task_height);
+  if (!blocks.empty()) {
+    return blocks.front();
+  }
+  return buildTaskOverallBlock(task, lanes, top_margin, lane_height,
+                               task_height);
+}
+
+static TaskBlock getOutgoingAnchorBlock(const VisualTask &task,
+                                        ArrayRef<Lane> lanes, int top_margin,
+                                        int lane_height, int task_height) {
+  SmallVector<TaskBlock> blocks =
+      buildTaskBlocks(task, lanes, top_margin, lane_height, task_height);
+  if (!blocks.empty()) {
+    return blocks.back();
+  }
+  return buildTaskOverallBlock(task, lanes, top_margin, lane_height,
+                               task_height);
+}
+
 static const char *getTaskColor(int task_index) {
   static constexpr const char *kColors[] = {
       "#fff4a8", "#ffd7a8", "#bfeaf6", "#f1a6a6", "#c8e8b8",
@@ -384,14 +554,6 @@ static double getMaxDrawEnd(ArrayRef<VisualTask> tasks) {
     max_draw_end = std::max(max_draw_end, task.draw_start + task.draw_width);
   }
   return max_draw_end;
-}
-
-static int getTaskY(const VisualTask &task, ArrayRef<Lane> lanes,
-                    int top_margin, int lane_height) {
-  int top_lane = getTaskTopLane(task, lanes);
-  int bottom_lane = getTaskBottomLane(task, lanes);
-  return top_margin + top_lane * lane_height + 12 +
-         (bottom_lane - top_lane) * lane_height / 2;
 }
 
 static void emitSvg(ArrayRef<VisualTask> tasks, func::FuncOp func,
@@ -498,39 +660,52 @@ static void emitSvg(ArrayRef<VisualTask> tasks, func::FuncOp func,
   };
 
   for (auto [task_idx, task] : llvm::enumerate(tasks)) {
-    int y = getTaskY(task, lanes, kTopMargin, kLaneHeight);
     double x = task_x(task);
     double w = task_w(task);
-    os << "  <rect x=\"" << x << "\" y=\"" << y << "\" width=\"" << w
-       << "\" height=\"" << kTaskHeight
-       << "\" rx=\"8\" fill=\"" << getTaskColor(task_idx)
-       << "\" stroke=\"black\" stroke-width=\"2\"/>\n";
-    if (w >= 34.0) {
-      os << "  <text x=\"" << (x + w / 2) << "\" y=\"" << (y + 29)
-         << "\" text-anchor=\"middle\" font-family=\"sans-serif\" "
-            "font-size=\"16\" font-weight=\"700\">"
-         << escapeXml(task.alias) << "</text>\n";
-    } else {
-      os << "  <text x=\"" << (x + w + 4) << "\" y=\"" << (y + 16)
-         << "\" font-family=\"sans-serif\" font-size=\"13\" "
-            "font-weight=\"700\">"
-         << escapeXml(task.alias) << "</text>\n";
+    SmallVector<TaskBlock> blocks =
+        buildTaskBlocks(task, lanes, kTopMargin, kLaneHeight, kTaskHeight);
+    for (const TaskBlock &block : blocks) {
+      os << "  <rect x=\"" << x << "\" y=\"" << block.y << "\" width=\""
+         << w << "\" height=\"" << block.height
+         << "\" rx=\"8\" fill=\"" << getTaskColor(task_idx)
+         << "\" stroke=\"black\" stroke-width=\"2\"/>\n";
+      std::string label = task.alias;
+      if (task.active_replicas > 1) {
+        label += ".r" + std::to_string(block.replica_id);
+      }
+      if (w >= 34.0) {
+        os << "  <text x=\"" << (x + w / 2) << "\" y=\""
+           << (block.y + block.height / 2 + 6)
+           << "\" text-anchor=\"middle\" font-family=\"sans-serif\" "
+              "font-size=\"16\" font-weight=\"700\">"
+           << escapeXml(label) << "</text>\n";
+      } else {
+        os << "  <text x=\"" << (x + w + 4) << "\" y=\""
+           << (block.y + 16)
+           << "\" font-family=\"sans-serif\" font-size=\"13\" "
+              "font-weight=\"700\">"
+           << escapeXml(label) << "</text>\n";
+      }
+      os << "  <title>" << escapeXml(task.name)
+         << " replica=" << block.replica_id << " start=" << task.start_time
+         << " end=" << task.end_time << " duration=" << task.duration
+         << " replicas=" << task.active_replicas << "</title>\n";
     }
-    os << "  <title>" << escapeXml(task.name) << " start="
-       << task.start_time << " end=" << task.end_time
-       << " duration=" << task.duration
-       << " replicas=" << task.active_replicas
-       << "</title>\n";
   }
 
   for (auto [task_idx, task] : llvm::enumerate(tasks)) {
     double x1 = task_x(task) + task_w(task);
-    int y1 = getTaskY(task, lanes, kTopMargin, kLaneHeight) + kTaskHeight / 2;
+    TaskBlock task_block =
+        getOutgoingAnchorBlock(task, lanes, kTopMargin, kLaneHeight,
+                               kTaskHeight);
+    int y1 = task_block.y + task_block.height / 2;
     for (int successor : task.successors) {
       const VisualTask &next_task = tasks[successor];
       double x2 = task_x(next_task);
-      int y2 = getTaskY(next_task, lanes, kTopMargin, kLaneHeight) +
-               kTaskHeight / 2;
+      TaskBlock next_task_block =
+          getIncomingAnchorBlock(next_task, lanes, kTopMargin, kLaneHeight,
+                                 kTaskHeight);
+      int y2 = next_task_block.y + next_task_block.height / 2;
       double mid_x = (x1 + x2) / 2.0;
       os << "  <path d=\"M" << x1 << " " << y1 << " C" << mid_x << " "
          << y1 << ", " << mid_x << " " << y2 << ", " << x2 << " " << y2
