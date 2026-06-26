@@ -50,7 +50,7 @@
 // TASKFLOW-NEXT:       taskflow.yield reads(%arg3 : memref<64x64xf32>) writes(%arg5 : memref<?x64xf32>)
 // TASKFLOW-NEXT:     }
 
-// NEURA:          %dependency_read_out_6, %dependency_write_out_7 = taskflow.task @Task_3 dependency_read_in(%arg0, %dependency_write_out, %dependency_write_out_5 : memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>) dependency_write_in(%dependency_write_out_5 : memref<?x64xf32>) value_inputs(%dim : index) [original_read_memrefs(%arg0, %alloc, %alloc_4 : memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>), original_write_memrefs(%alloc_4 : memref<?x64xf32>)] {dlp_replicable = true, runtime_managable = true} : (memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>, memref<?x64xf32>, index) -> (memref<64x64xf32>, memref<?x64xf32>) {
+// NEURA:          %dependency_read_out_6, %dependency_write_out_7 = taskflow.task @Task_3 dependency_read_in(%arg0, %dependency_write_out, %dependency_write_out_5 : memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>) dependency_write_in(%dependency_write_out_5 : memref<?x64xf32>) value_inputs(%dim : index) [original_read_memrefs(%arg0, %alloc, %alloc_4 : memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>), original_write_memrefs(%alloc_4 : memref<?x64xf32>)] {{.*}}dlp_replicable = true{{.*}} : (memref<?x64xf32>, memref<64x64xf32>, memref<?x64xf32>, memref<?x64xf32>, index) -> (memref<64x64xf32>, memref<?x64xf32>) {
 // NEURA-NEXT:     ^bb0(%arg2: memref<?x64xf32>, %arg3: memref<64x64xf32>, %arg4: memref<?x64xf32>, %arg5: memref<?x64xf32>, %arg6: index):
 // NEURA-NEXT:       %c64 = arith.constant 64 : index
 // NEURA-NEXT:       %c0_45 = arith.constant 0 : index

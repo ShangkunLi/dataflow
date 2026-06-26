@@ -52,7 +52,7 @@
 // TASKFLOW-NEXT:       taskflow.yield writes(%arg5 : memref<?x8xf32>)
 // TASKFLOW-NEXT:     }
 
-// NEURA:          %dependency_write_out_2 = taskflow.task @Task_1 dependency_read_in(%arg1, %arg0, %dependency_write_out : memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>) dependency_write_in(%dependency_write_out : memref<?x8xf32>) value_inputs(%dim, %dim_0 : index, index) [original_read_memrefs(%arg1, %arg0, %alloc : memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>), original_write_memrefs(%alloc : memref<?x8xf32>)] {dlp_replicable = true, runtime_managable = true} : (memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>, memref<?x8xf32>, index, index) -> (memref<?x8xf32>) {
+// NEURA:          %dependency_write_out_2 = taskflow.task @Task_1 dependency_read_in(%arg1, %arg0, %dependency_write_out : memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>) dependency_write_in(%dependency_write_out : memref<?x8xf32>) value_inputs(%dim, %dim_0 : index, index) [original_read_memrefs(%arg1, %arg0, %alloc : memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>), original_write_memrefs(%alloc : memref<?x8xf32>)] {{.*}}dlp_replicable = true{{.*}} : (memref<?x?xf32>, memref<?x8xf32>, memref<?x8xf32>, memref<?x8xf32>, index, index) -> (memref<?x8xf32>) {
 // NEURA-NEXT:     ^bb0(%arg2: memref<?x?xf32>, %arg3: memref<?x8xf32>, %arg4: memref<?x8xf32>, %arg5: memref<?x8xf32>, %arg6: index, %arg7: index):
 // NEURA-NEXT:       %c8 = arith.constant 8 : index
 // NEURA-NEXT:       %c0_17 = arith.constant 0 : index

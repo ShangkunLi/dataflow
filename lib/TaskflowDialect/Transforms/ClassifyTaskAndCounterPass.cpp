@@ -17,11 +17,8 @@
 //   counter_id         – unique integer index within the task (0-based)
 //
 // Per taskflow.task:
-//   runtime_managable = true when the task can be managed by the AMOEBA
-//   runtime: it has at least one symbol-bound counter and its
-//   hyperblock bodies do not carry loop-carried dependences.
-//   dlp_replicable = true when the task can be replicated for data-level
-//   parallelism.
+//   dlp_replicable = true when the task has at least one counter-driven
+//   hyperblock dimension that can be partitioned for data-level parallelism.
 //
 // Classification rules for a bound value inside the task body:
 //   arith.constant                             → constant_bound
@@ -42,7 +39,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
@@ -166,70 +162,66 @@ static BoundKind classifyCounterDynamism(TaskflowCounterOp counter_op,
 }
 
 //===----------------------------------------------------------------------===//
-// Hyperblock patterns for runtime management suitability.
+// Hyperblock patterns for DLP suitability.
 //===----------------------------------------------------------------------===//
 
-enum class TaskPattern { LoopCarriedDependence };
-
-static bool taskContainsHyperblock(TaskflowTaskOp task_op) {
-  bool saw_hyperblock = false;
-  task_op.walk([&](TaskflowHyperblockOp) {
-    saw_hyperblock = true;
-    return WalkResult::interrupt();
-  });
-  return saw_hyperblock;
-}
-
-static bool
-hyperblockMatchesLoopCarriedDependencePattern(TaskflowHyperblockOp hb) {
-  if (!hb.getIterArgs().empty()) {
-    return true;
+static unsigned
+getHyperblockPartitionableCounterCount(TaskflowHyperblockOp hb) {
+  unsigned trigger_count = hb.getIndices().size();
+  if (trigger_count == 0) {
+    return 0;
   }
 
-  bool matches = false;
-
-  hb.walk([&](TaskflowHyperblockYieldOp yield_op) {
-    if (!yield_op.getIterArgsNext().empty()) {
-      matches = true;
-    }
-  });
-
-  hb.walk([&](affine::AffineForOp for_op) {
-    if (for_op.getNumIterOperands() > 0 || for_op.getNumResults() > 0) {
-      matches = true;
-    }
-  });
-
-  hb.walk([&](scf::ForOp for_op) {
-    if (for_op.getNumRegionIterArgs() > 0 || for_op.getNumResults() > 0) {
-      matches = true;
-    }
-  });
-
-  return matches;
+  // In the counter-chain lowering used before kernel generation, iter_args
+  // are produced by the deepest loop in the perfect band. Those deepest loop
+  // counters carry reduction state and are not valid DLP partition dimensions.
+  // Outer counter triggers still describe independent output/input tiles and
+  // remain partitionable. For example, a matmul-like (i, j, k) nest with an
+  // accumulator on k has three trigger counters and one iter_arg; i and j are
+  // partitionable while k is not.
+  unsigned loop_carried_trigger_count = hb.getIterArgs().empty() ? 0 : 1;
+  return trigger_count - loop_carried_trigger_count;
 }
 
-static bool taskMatchesLoopCarriedDependencePattern(TaskflowTaskOp task_op) {
-  WalkResult result = task_op.walk([&](TaskflowHyperblockOp hb) {
-    if (hyperblockMatchesLoopCarriedDependencePattern(hb)) {
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
+static DenseMap<Value, TaskflowCounterOp>
+buildCounterIndexMap(TaskflowTaskOp task_op) {
+  DenseMap<Value, TaskflowCounterOp> counter_by_index;
+  task_op.walk([&](TaskflowCounterOp counter_op) {
+    counter_by_index[counter_op.getCounterIndex()] = counter_op;
   });
-  return result.wasInterrupted();
+  return counter_by_index;
 }
 
-static bool taskMatchesPattern(TaskflowTaskOp task_op, TaskPattern pattern) {
-  switch (pattern) {
-  case TaskPattern::LoopCarriedDependence:
-    return taskMatchesLoopCarriedDependencePattern(task_op);
-  }
-  llvm_unreachable("unknown TaskPattern");
-}
+static SmallVector<int32_t>
+collectPartitionableCounterIds(TaskflowTaskOp task_op) {
+  DenseMap<Value, TaskflowCounterOp> counter_by_index =
+      buildCounterIndexMap(task_op);
+  DenseSet<int32_t> seen_counter_ids;
+  SmallVector<int32_t> partitionable_counter_ids;
 
-static bool taskHasDlpCapability(TaskflowTaskOp task_op) {
-  return taskContainsHyperblock(task_op) &&
-         !taskMatchesPattern(task_op, TaskPattern::LoopCarriedDependence);
+  task_op.walk([&](TaskflowHyperblockOp hb) {
+    unsigned partitionable_count = getHyperblockPartitionableCounterCount(hb);
+    for (auto [trigger_idx, counter_index] : llvm::enumerate(hb.getIndices())) {
+      if (trigger_idx >= partitionable_count) {
+        break;
+      }
+
+      TaskflowCounterOp counter_op = counter_by_index.lookup(counter_index);
+      if (!counter_op) {
+        continue;
+      }
+
+      std::optional<uint32_t> counter_id = counter_op.getCounterId();
+      assert(counter_id &&
+             "partitionable taskflow.counter must be classified first");
+
+      int32_t signed_counter_id = static_cast<int32_t>(*counter_id);
+      if (seen_counter_ids.insert(signed_counter_id).second) {
+        partitionable_counter_ids.push_back(signed_counter_id);
+      }
+    }
+  });
+  return partitionable_counter_ids;
 }
 
 //===----------------------------------------------------------------------===//
@@ -314,46 +306,21 @@ static LogicalResult classifyCounters(TaskflowTaskOp task_op) {
 // DLP-capability task tagging
 //===----------------------------------------------------------------------===//
 
-static bool taskIsDlpReplicable(TaskflowTaskOp task_op) {
-  auto attr = task_op->getAttrOfType<BoolAttr>("dlp_replicable");
-  return attr && attr.getValue();
-}
-
 static void identifyDlpCapability(TaskflowTaskOp task_op) {
   // Re-running this pass should not preserve task-level tags from an older
   // classification result.
   task_op->removeAttr("dlp_replicable");
-
-  if (taskHasDlpCapability(task_op)) {
-    OpBuilder builder(task_op.getContext());
-    task_op->setAttr("dlp_replicable", builder.getBoolAttr(true));
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Runtime-managable task tagging
-//===----------------------------------------------------------------------===//
-
-static bool taskHasSymbolBoundCounter(TaskflowTaskOp task_op) {
-  WalkResult result = task_op.walk([&](TaskflowCounterOp counter_op) {
-    std::optional<StringRef> dynamism = counter_op.getCounterDynamism();
-    if (dynamism && *dynamism == "symbol_bound") {
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return result.wasInterrupted();
-}
-
-static void identifyRuntimeManagableTask(TaskflowTaskOp task_op) {
-  // Re-running this pass should not preserve task-level tags from an older
-  // classification result.
+  task_op->removeAttr("dlp_partitionable_counter_ids");
   task_op->removeAttr("task_type");
   task_op->removeAttr("runtime_managable");
 
-  if (taskHasSymbolBoundCounter(task_op) && taskIsDlpReplicable(task_op)) {
-    OpBuilder builder(task_op.getContext());
-    task_op->setAttr("runtime_managable", builder.getBoolAttr(true));
+  SmallVector<int32_t> partitionable_counter_ids =
+      collectPartitionableCounterIds(task_op);
+  if (!partitionable_counter_ids.empty()) {
+    Builder builder(task_op.getContext());
+    task_op->setAttr("dlp_replicable", builder.getBoolAttr(true));
+    task_op->setAttr("dlp_partitionable_counter_ids",
+                     builder.getDenseI32ArrayAttr(partitionable_counter_ids));
   }
 }
 
@@ -367,7 +334,7 @@ struct ClassifyTaskAndCounterPass
 
   StringRef getArgument() const override { return "classify-task-and-counter"; }
   StringRef getDescription() const override {
-    return "Classify taskflow counters and mark runtime-managable tasks.";
+    return "Classify taskflow counters and DLP-replicable tasks.";
   }
 
   void runOnOperation() override {
@@ -386,8 +353,6 @@ struct ClassifyTaskAndCounterPass
 
     module.walk(
         [&](TaskflowTaskOp task_op) { identifyDlpCapability(task_op); });
-    module.walk(
-        [&](TaskflowTaskOp task_op) { identifyRuntimeManagableTask(task_op); });
   }
 };
 

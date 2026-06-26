@@ -51,7 +51,7 @@ def ConstructHyperblockFromTask
 
 def ClassifyTaskAndCounter : Pass<"classify-task-and-counter", "ModuleOp"> {
   let summary =
-      "Classifies taskflow counters and marks runtime-managable tasks";
+      "Classifies taskflow counters and DLP-replicable tasks";
   let description = [{
     Annotates every taskflow.task and its contained taskflow.counter ops.
 
@@ -69,13 +69,12 @@ def ClassifyTaskAndCounter : Pass<"classify-task-and-counter", "ModuleOp"> {
       counter_id – unique integer index within the task (0-based)
 
     Per task:
-      dlp_replicable = true when the task has hyperblocks without
-      loop-carried dependence and can be considered for data-level parallel
-      replication.
-
-      runtime_managable = true only when the task has at least one
-      symbol_bound counter and is DLP-replicable.
-      Non-runtime-managable tasks are left unmarked.
+      dlp_replicable = true when the task has a counter-driven hyperblock
+      with at least one partitionable counter dimension. Reduction counters
+      carried by iter_args are excluded from this decision, but they do not
+      prevent replication across the remaining independent dimensions.
+      dlp_partitionable_counter_ids records the counter_id values for those
+      independent dimensions.
   }];
   let constructor = "taskflow::createClassifyTaskAndCounterPass()";
   let dependentDialects = ["mlir::affine::AffineDialect",
