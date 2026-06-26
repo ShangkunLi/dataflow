@@ -166,6 +166,25 @@ def AnalyzeTaskPipelineInterval
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def VisualizeTaskOrchestration
+    : Pass<"visualize-task-orchestration", "func::FuncOp"> {
+  let summary =
+      "Emits an SVG visualization of scheduled Taskflow orchestration";
+  let description = [{
+    Reads task_orchestration_info and profile_info from already scheduled
+    taskflow.task operations and emits an SVG timeline showing CGRA lanes,
+    task execution blocks, temporal reuse, and task dependency arrows. This
+    pass is for inspection only and does not mutate the IR.
+  }];
+  let options =
+      [Option<"outputFile", "output-file", "std::string",
+              /*default=*/"\"\"",
+              "Output SVG file. If empty, the SVG is printed to stdout.">];
+  let constructor = "taskflow::createVisualizeTaskOrchestrationPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def FuseTask : Pass<"fuse-task", "func::FuncOp"> {
   let summary =
       "Fuses Taskflow tasks using producer-consumer and sibling strategies";

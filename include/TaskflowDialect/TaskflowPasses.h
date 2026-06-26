@@ -26,6 +26,7 @@ std::unique_ptr<mlir::Pass> createConstructHyperblockFromTaskPass();
 std::unique_ptr<mlir::Pass> createClassifyTaskAndCounterPass();
 std::unique_ptr<mlir::Pass> createOrchestrateTaskOnCgraPass();
 std::unique_ptr<mlir::Pass> createAnalyzeTaskPipelineIntervalPass();
+std::unique_ptr<mlir::Pass> createVisualizeTaskOrchestrationPass();
 std::unique_ptr<mlir::Pass> createFuseTaskPass();
 
 //=========================================================//
