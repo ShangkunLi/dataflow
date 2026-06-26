@@ -140,6 +140,14 @@ def OrchestrateTaskOnCgra : Pass<"orchestrate-task-on-cgra", "func::FuncOp"> {
            "Task orchestration strategy: 'routing-critical-path' (default) or "
            "'throughput-guided'.">];
   let constructor = "taskflow::createOrchestrateTaskOnCgraPass()";
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::LLVM::LLVMDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
 }
 
 def AnalyzeTaskPipelineInterval
