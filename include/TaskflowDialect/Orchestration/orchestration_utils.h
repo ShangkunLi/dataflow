@@ -122,6 +122,7 @@ struct TaskScheduleResult {
     int start_time = 0;
     int duration = 1;
     int context_id = 0;
+    int replica_id = 0;
   };
 
   TaskflowTaskOp task;

@@ -285,6 +285,7 @@ struct CgraPosition {
   int start_time = 0; // Internal scheduling; not emitted to IR.
   int duration = 1;   // Read from profile_info; not emitted to IR.
   int context_id = 0; // Emitted to IR as task_orchestration_info.
+  int replica_id = 0; // Emitted to distinguish DLP replicas.
 
   bool operator==(const CgraPosition &other) const {
     return row == other.row && col == other.col;
@@ -724,7 +725,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
           return false;
         }
 
-        for (const auto &pos : placement.cgra_positions) {
+        for (CgraPosition pos : placement.cgra_positions) {
+          pos.replica_id = replica;
           task_node->placement.push_back(pos);
         }
 
@@ -768,9 +770,10 @@ bool TaskScheduler::schedule(func::FuncOp func,
                          return a.first < b.first;
                        });
       for (int ctx = 0; ctx < static_cast<int>(tasks_at_cell.size()); ++ctx) {
+        int start_time = tasks_at_cell[ctx].first;
         TaskNode *tn = tasks_at_cell[ctx].second;
         for (CgraPosition &pos : tn->placement) {
-          if (pos.row == r && pos.col == c) {
+          if (pos.row == r && pos.col == c && pos.start_time == start_time) {
             pos.context_id = ctx;
           }
         }
@@ -790,17 +793,29 @@ bool TaskScheduler::schedule(func::FuncOp func,
     SmallVector<NamedAttribute, 4> mapping_attrs;
 
     // 1. CGRA positions.
-    // Keys are in alphabetical order as required by DictionaryAttr:
-    // col < context_id < row.
+    bool emit_replica_id = false;
+    if (auto attr =
+            task_node->op->getAttrOfType<IntegerAttr>("active_replicas")) {
+      emit_replica_id = attr.getInt() > 1;
+    }
+
+    // Keys are in alphabetical order as required by DictionaryAttr.  For
+    // replicated tasks, cgra_positions also records replica_id so positions
+    // can be grouped back into independent DLP replicas.
     SmallVector<Attribute> pos_attrs;
     for (const auto &pos : task_node->placement) {
-      SmallVector<NamedAttribute, 3> coord_attrs;
+      SmallVector<NamedAttribute, 4> coord_attrs;
       coord_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "col"),
                          builder.getI32IntegerAttr(pos.col)));
       coord_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "context_id"),
                          builder.getI32IntegerAttr(pos.context_id)));
+      if (emit_replica_id) {
+        coord_attrs.push_back(
+            NamedAttribute(StringAttr::get(func.getContext(), "replica_id"),
+                           builder.getI32IntegerAttr(pos.replica_id)));
+      }
       coord_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "row"),
                          builder.getI32IntegerAttr(pos.row)));
@@ -864,6 +879,16 @@ bool TaskScheduler::schedule(func::FuncOp func,
           DictionaryAttr::get(func.getContext(), profile_attrs));
     }
 
+    // Preserve the selected composed-CGRA shape as final orchestration
+    // metadata.  `cgra_count`/`cgra_shape` are scheduler inputs, while
+    // `composed_cgra_*` describe how many adjacent CGRAs each replica uses.
+    if (Attribute count = task_node->op->getAttr("cgra_count")) {
+      task_node->op->setAttr("composed_cgra_count", count);
+    }
+    if (Attribute shape = task_node->op->getAttr("cgra_shape")) {
+      task_node->op->setAttr("composed_cgra_shape", shape);
+    }
+
     // Removes upstream resource-binding attributes that have been consumed.
     task_node->op->removeAttr("cgra_count");
     task_node->op->removeAttr("cgra_shape");
@@ -890,7 +915,8 @@ void TaskScheduler::recordScheduleResult(const TaskMemoryGraph &graph) {
       task_result.end_time =
           std::max(task_result.end_time, pos.start_time + pos.duration);
       task_result.cgra_occupancies.push_back(
-          {pos.row, pos.col, pos.start_time, pos.duration, pos.context_id});
+          {pos.row, pos.col, pos.start_time, pos.duration, pos.context_id,
+           pos.replica_id});
     }
 
     for (TaskNode *pred : task_node->ssa_operands) {

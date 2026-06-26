@@ -49,6 +49,7 @@ parseCgraOccupancy(TaskflowTaskOp task, Attribute attr) {
   auto row = dyn_cast_or_null<IntegerAttr>(coord.get("row"));
   auto col = dyn_cast_or_null<IntegerAttr>(coord.get("col"));
   auto context_id = dyn_cast_or_null<IntegerAttr>(coord.get("context_id"));
+  auto replica_id = dyn_cast_or_null<IntegerAttr>(coord.get("replica_id"));
   if (!row || !col || !context_id) {
     task.emitOpError() << "requires row, col, and context_id in each "
                           "task_orchestration_info.cgra_positions entry";
@@ -59,6 +60,9 @@ parseCgraOccupancy(TaskflowTaskOp task, Attribute attr) {
   occupancy.row = static_cast<int>(row.getInt());
   occupancy.col = static_cast<int>(col.getInt());
   occupancy.context_id = static_cast<int>(context_id.getInt());
+  if (replica_id) {
+    occupancy.replica_id = static_cast<int>(replica_id.getInt());
+  }
   return occupancy;
 }
 
