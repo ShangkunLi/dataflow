@@ -1,10 +1,17 @@
 // Orchestrate Taskflow tasks onto a multi-CGRA grid.
 
 #include "NeuraDialect/Architecture/Architecture.h"
+#include "NeuraDialect/NeuraDialect.h"
 #include "TaskflowDialect/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
 #include "TaskflowDialect/Orchestration/ThroughputGuidedTaskOrchestration/ThroughputGuidedTaskOrchestration.h"
+#include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowPasses.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringSwitch.h"
 
@@ -41,6 +48,13 @@ struct OrchestrateTaskOnCgraPass
            "spatial-temporal)";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<affine::AffineDialect, arith::ArithDialect,
+                    LLVM::LLVMDialect, func::FuncDialect,
+                    memref::MemRefDialect, neura::NeuraDialect,
+                    scf::SCFDialect, taskflow::TaskflowDialect>();
+  }
+
   Option<std::string> schedulingMode{
       *this, "scheduling-mode",
       llvm::cl::desc("Task scheduling mode: 'spatial' (one task per CGRA, "
@@ -70,7 +84,12 @@ struct OrchestrateTaskOnCgraPass
       return;
     }
 
-    strategy->runTaskOrchestration(getOperation());
+    if (!strategy->runTaskOrchestration(getOperation())) {
+      getOperation()->emitError()
+          << "failed to orchestrate taskflow tasks with strategy: "
+          << orchestrationStrategy.getValue();
+      signalPassFailure();
+    }
   }
 };
 
