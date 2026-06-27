@@ -1,5 +1,6 @@
 // Visualize scheduled Taskflow orchestration.
 
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "TaskflowDialect/Orchestration/orchestration_utils.h"
 #include "TaskflowDialect/TaskflowOps.h"
 #include "TaskflowDialect/TaskflowPasses.h"
@@ -304,30 +305,32 @@ static LogicalResult prepareSchedule(func::FuncOp func,
   return computeTaskTimes(func, tasks);
 }
 
-static SmallVector<Lane> collectUsedLanes(ArrayRef<VisualTask> tasks) {
-  DenseSet<int64_t> seen_lanes;
+static void extendGridToFitTasks(ArrayRef<VisualTask> tasks, int &grid_rows,
+                                 int &grid_cols) {
+  grid_rows = std::max(1, grid_rows);
+  grid_cols = std::max(1, grid_cols);
   SmallVector<Lane> lanes;
   for (const VisualTask &task : tasks) {
     for (const CgraUse &cgra_use : task.cgra_uses) {
-      int64_t key = encodeCgraLocation(cgra_use.row, cgra_use.col);
-      if (!seen_lanes.insert(key).second) {
-        continue;
-      }
+      grid_rows = std::max(grid_rows, cgra_use.row + 1);
+      grid_cols = std::max(grid_cols, cgra_use.col + 1);
+    }
+  }
+}
+
+static SmallVector<Lane> collectCgraGridLanes(int grid_rows, int grid_cols) {
+  SmallVector<Lane> lanes;
+  lanes.reserve(grid_rows * grid_cols);
+  for (int row = 0; row < grid_rows; ++row) {
+    for (int col = 0; col < grid_cols; ++col) {
       Lane lane;
-      lane.row = cgra_use.row;
-      lane.col = cgra_use.col;
-      lane.label = "CGRA(" + std::to_string(cgra_use.row) + "," +
-                   std::to_string(cgra_use.col) + ")";
+      lane.row = row;
+      lane.col = col;
+      lane.label =
+          "CGRA(" + std::to_string(row) + "," + std::to_string(col) + ")";
       lanes.push_back(std::move(lane));
     }
   }
-
-  llvm::sort(lanes, [](const Lane &lhs, const Lane &rhs) {
-    if (lhs.row != rhs.row) {
-      return lhs.row < rhs.row;
-    }
-    return lhs.col < rhs.col;
-  });
   return lanes;
 }
 
@@ -557,11 +560,9 @@ static double getMaxDrawEnd(ArrayRef<VisualTask> tasks) {
 }
 
 static void emitSvg(ArrayRef<VisualTask> tasks, func::FuncOp func,
-                    raw_ostream &os) {
-  SmallVector<Lane> lanes = collectUsedLanes(tasks);
-  if (lanes.empty()) {
-    lanes.push_back({0, 0, "CGRA(0,0)"});
-  }
+                    int grid_rows, int grid_cols, raw_ostream &os) {
+  extendGridToFitTasks(tasks, grid_rows, grid_cols);
+  SmallVector<Lane> lanes = collectCgraGridLanes(grid_rows, grid_cols);
 
   constexpr int kLeftMargin = 135;
   constexpr int kRightMargin = 50;
@@ -606,6 +607,9 @@ static void emitSvg(ArrayRef<VisualTask> tasks, func::FuncOp func,
      << "\" y=\"32\" font-family=\"sans-serif\" font-size=\"22\" "
         "font-weight=\"700\">"
      << escapeXml(func.getSymName()) << "</text>\n";
+  os << "  <text x=\"" << kLeftMargin
+     << "\" y=\"58\" font-family=\"sans-serif\" font-size=\"13\" "
+        "fill=\"#555\">CGRA(row,col): row-major multi-CGRA coordinate</text>\n";
 
   for (auto [lane_idx, lane] : llvm::enumerate(lanes)) {
     int y = kTopMargin + static_cast<int>(lane_idx) * kLaneHeight;
@@ -747,8 +751,12 @@ struct VisualizeTaskOrchestrationPass
       return;
     }
 
+    const neura::Architecture &architecture = neura::getArchitecture();
+    int grid_rows = architecture.getMultiCgraRows();
+    int grid_cols = architecture.getMultiCgraColumns();
+
     if (outputFile.empty()) {
-      emitSvg(tasks, func, llvm::outs());
+      emitSvg(tasks, func, grid_rows, grid_cols, llvm::outs());
       return;
     }
 
@@ -760,7 +768,7 @@ struct VisualizeTaskOrchestrationPass
       signalPassFailure();
       return;
     }
-    emitSvg(tasks, func, file);
+    emitSvg(tasks, func, grid_rows, grid_cols, file);
   }
 };
 
