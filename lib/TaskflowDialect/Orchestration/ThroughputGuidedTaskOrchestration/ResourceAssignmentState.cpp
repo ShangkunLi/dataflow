@@ -196,6 +196,8 @@ void ResourceAssignmentState::applyCurrentResourceAssignment() const {
                         assignment.active_replicas);
     int sample_trip_count = profile ? profile->sample_trip_count : 1;
     int steps = profile ? profile->steps : 1;
+    int materialized_operation_count =
+        profile ? profile->materialized_operation_count : 1;
     profile_attrs.push_back(
         NamedAttribute(StringAttr::get(task->getContext(), "compiled_ii"),
                        builder.getI32IntegerAttr(compiled_ii)));
@@ -208,6 +210,9 @@ void ResourceAssignmentState::applyCurrentResourceAssignment() const {
     profile_attrs.push_back(
         NamedAttribute(StringAttr::get(task->getContext(), "steps"),
                        builder.getI32IntegerAttr(steps)));
+    profile_attrs.push_back(NamedAttribute(
+        StringAttr::get(task->getContext(), "materialized_operation_count"),
+        builder.getI32IntegerAttr(materialized_operation_count)));
     task->setAttr("profile_info",
                   DictionaryAttr::get(task->getContext(), profile_attrs));
   }

@@ -22,6 +22,7 @@ struct TaskProfile {
   int compiled_ii = 1;
   int steps = 1;
   int sample_trip_count = 1;
+  int materialized_operation_count = 1;
   int estimated_latency = 1;
   bool mapper_succeeded = false;
 };
@@ -54,9 +55,10 @@ private:
                             int composed_cgra_count) const;
 
   // Invokes the Neura mapper for one task profile and extracts compiled II and
-  // step count.
+  // step count, and materialized operation count.
   bool runMapperForTaskProfile(TaskflowTaskOp task, const CgraShape &shape,
                                int &compiled_ii, int &steps,
+                               int &materialized_operation_count,
                                bool &mapper_succeeded) const;
 
   int max_composed_cgra_count_;

@@ -4,6 +4,7 @@
 
 #include "Conversion/ConversionPasses.h"
 #include "NeuraDialect/Architecture/Architecture.h"
+#include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraAttributes.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
@@ -248,9 +249,11 @@ static void loadMapperDialects(MLIRContext &ctx) {
 }
 
 static LogicalResult extractMappingInfo(ModuleOp module, int &compiled_ii,
-                                        int &steps) {
+                                        int &steps,
+                                        int &materialized_operation_count) {
   bool found_mapping_info = false;
   int max_time_step = -1;
+  int mapped_op_count = 0;
   module.walk([&](func::FuncOp fn) {
     if (!fn->hasAttr("accelerator")) {
       return;
@@ -272,6 +275,9 @@ static LogicalResult extractMappingInfo(ModuleOp module, int &compiled_ii,
       if (!mapping_locs) {
         return;
       }
+      if (!mapping_locs.empty() && !neura::is_non_materialized(op)) {
+        ++mapped_op_count;
+      }
       for (Attribute loc_attr : mapping_locs) {
         auto loc_dict = dyn_cast<DictionaryAttr>(loc_attr);
         if (!loc_dict) {
@@ -288,11 +294,14 @@ static LogicalResult extractMappingInfo(ModuleOp module, int &compiled_ii,
     });
   });
 
-  if (!found_mapping_info || max_time_step < 0) {
+  if (!found_mapping_info || max_time_step < 0 || mapped_op_count <= 0) {
     return failure();
   }
   steps = max_time_step + 1;
+  materialized_operation_count = mapped_op_count;
   assert(steps > 0 && "Mapper step count must be positive.\n");
+  assert(materialized_operation_count > 0 &&
+         "Mapper materialized operation count must be positive.\n");
   return success();
 }
 
@@ -300,6 +309,7 @@ static LogicalResult runMapperOnKernel(neura::KernelOp kernel, int x_tiles,
                                        int y_tiles,
                                        const std::string &valid_tiles,
                                        int &compiled_ii, int &steps,
+                                       int &materialized_operation_count,
                                        bool &mapper_succeeded) {
   std::optional<std::string> module_text = buildMapperWrapperModuleText(kernel);
   assert(module_text && "Task profiling must build a mapper wrapper module.\n");
@@ -342,7 +352,8 @@ static LogicalResult runMapperOnKernel(neura::KernelOp kernel, int x_tiles,
     return failure();
   }
 
-  LogicalResult extract_result = extractMappingInfo(module, compiled_ii, steps);
+  LogicalResult extract_result = extractMappingInfo(
+      module, compiled_ii, steps, materialized_operation_count);
   assert(succeeded(extract_result) &&
          "Task profiling mapper result must contain mapping info.\n");
   if (failed(extract_result)) {
@@ -395,19 +406,24 @@ TaskProfiler::profileTaskOnComposedCgra(TaskflowTaskOp task,
 
   int compiled_ii = -1;
   int steps = -1;
+  int materialized_operation_count = -1;
   bool mapper_succeeded = false;
-  bool profiling_succeeded = runMapperForTaskProfile(task, shape, compiled_ii,
-                                                     steps, mapper_succeeded);
+  bool profiling_succeeded = runMapperForTaskProfile(
+      task, shape, compiled_ii, steps, materialized_operation_count,
+      mapper_succeeded);
   if (!profiling_succeeded || !mapper_succeeded) {
     return std::nullopt;
   }
 
   assert(compiled_ii > 0 && "Mapper compiled II must be positive.\n");
   assert(steps > 0 && "Mapper step count must be positive.\n");
+  assert(materialized_operation_count > 0 &&
+         "Mapper materialized operation count must be positive.\n");
   assert(profile.sample_trip_count > 0 &&
          "Task profile trip count must be positive.\n");
   profile.compiled_ii = compiled_ii;
   profile.steps = steps;
+  profile.materialized_operation_count = materialized_operation_count;
   profile.mapper_succeeded = mapper_succeeded;
   int64_t estimated_latency = static_cast<int64_t>(profile.compiled_ii) *
                                   (profile.sample_trip_count - 1) +
@@ -422,6 +438,7 @@ TaskProfiler::profileTaskOnComposedCgra(TaskflowTaskOp task,
 bool TaskProfiler::runMapperForTaskProfile(TaskflowTaskOp task,
                                            const CgraShape &shape,
                                            int &compiled_ii, int &steps,
+                                           int &materialized_operation_count,
                                            bool &mapper_succeeded) const {
   neura::KernelOp source_kernel;
   task.walk([&](neura::KernelOp kernel) {
@@ -443,7 +460,8 @@ bool TaskProfiler::runMapperForTaskProfile(TaskflowTaskOp task,
 
   LogicalResult result =
       runMapperOnKernel(source_kernel, x_tiles, y_tiles, valid_tiles,
-                        compiled_ii, steps, mapper_succeeded);
+                        compiled_ii, steps, materialized_operation_count,
+                        mapper_succeeded);
   return succeeded(result);
 }
 
