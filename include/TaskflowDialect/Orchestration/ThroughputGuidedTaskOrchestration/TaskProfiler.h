@@ -43,13 +43,13 @@ public:
   // These profiles are internal search inputs and are not emitted to IR.
   TaskProfileMap profileFunction(func::FuncOp func) const;
 
-  // Profiles one task across composed-CGRA options by invoking the Neura
-  // mapper on the task's kernel. Symbol-bound counters use the profiler's
-  // configured sample trip count.
+  // Profiles one task across rectangular composed-CGRA options by invoking
+  // the Neura mapper on the task's kernel. Symbol-bound counters use the
+  // profiler's configured sample trip count.
   llvm::SmallVector<TaskProfile> profileTask(TaskflowTaskOp task) const;
 
 private:
-  // Profiles one task on the given composed-CGRA.
+  // Profiles one task on the given rectangular composed-CGRA.
   std::optional<TaskProfile>
   profileTaskOnComposedCgra(TaskflowTaskOp task, const CgraShape &shape,
                             int composed_cgra_count) const;

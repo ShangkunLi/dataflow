@@ -135,31 +135,6 @@ static bool taskContainsNeuraKernel(TaskflowTaskOp task) {
   return found_kernel;
 }
 
-static std::string buildValidTileList(const CgraShape &shape) {
-  if (shape.is_rectangular) {
-    return "";
-  }
-
-  int per_cgra_cols = neura::getArchitecture().getPerCgraColumns();
-  int per_cgra_rows = neura::getArchitecture().getPerCgraRows();
-  std::string valid_tiles;
-  llvm::raw_string_ostream os(valid_tiles);
-  bool first_tile = true;
-  for (auto [cgra_col, cgra_row] : shape.cgra_positions) {
-    for (int tile_row = 0; tile_row < per_cgra_rows; ++tile_row) {
-      for (int tile_col = 0; tile_col < per_cgra_cols; ++tile_col) {
-        if (!first_tile) {
-          os << ",";
-        }
-        first_tile = false;
-        os << (cgra_col * per_cgra_cols + tile_col) << "_"
-           << (cgra_row * per_cgra_rows + tile_row);
-      }
-    }
-  }
-  return os.str();
-}
-
 static void addMapperLoweringPipeline(PassManager &pm) {
   pm.addPass(createCSEPass());
   pm.addPass(createLowerAffinePass());
@@ -305,12 +280,10 @@ static LogicalResult extractMappingInfo(ModuleOp module, int &compiled_ii,
   return success();
 }
 
-static LogicalResult runMapperOnKernel(neura::KernelOp kernel, int x_tiles,
-                                       int y_tiles,
-                                       const std::string &valid_tiles,
-                                       int &compiled_ii, int &steps,
-                                       int &materialized_operation_count,
-                                       bool &mapper_succeeded) {
+static LogicalResult
+runMapperOnKernel(neura::KernelOp kernel, int x_tiles, int y_tiles,
+                  const std::string &valid_tiles, int &compiled_ii, int &steps,
+                  int &materialized_operation_count, bool &mapper_succeeded) {
   std::optional<std::string> module_text = buildMapperWrapperModuleText(kernel);
   assert(module_text && "Task profiling must build a mapper wrapper module.\n");
   if (!module_text) {
@@ -379,6 +352,12 @@ TaskProfiler::profileTask(TaskflowTaskOp task) const {
   for (int cgra_count = 1; cgra_count <= max_composed_cgra_count_;
        ++cgra_count) {
     for (const CgraShape &shape : getAllPlacementShapes(cgra_count)) {
+      // Throughput-guided profiling intentionally keeps the tile-array
+      // candidate frontier rectangular. Irregular L/T shapes are not profiled
+      // or selected by this strategy.
+      if (!shape.is_rectangular) {
+        continue;
+      }
       std::optional<TaskProfile> profile =
           profileTaskOnComposedCgra(task, shape, cgra_count);
       if (profile) {
@@ -397,6 +376,13 @@ std::optional<TaskProfile>
 TaskProfiler::profileTaskOnComposedCgra(TaskflowTaskOp task,
                                         const CgraShape &shape,
                                         int composed_cgra_count) const {
+  assert(shape.is_rectangular &&
+         "Throughput-guided profiling only accepts rectangular "
+         "composed-CGRA shapes.\n");
+  if (!shape.is_rectangular) {
+    return std::nullopt;
+  }
+
   TaskProfile profile;
   profile.composed_cgra_count = composed_cgra_count;
   profile.composed_cgra_shape = shape.irAttr();
@@ -408,9 +394,9 @@ TaskProfiler::profileTaskOnComposedCgra(TaskflowTaskOp task,
   int steps = -1;
   int materialized_operation_count = -1;
   bool mapper_succeeded = false;
-  bool profiling_succeeded = runMapperForTaskProfile(
-      task, shape, compiled_ii, steps, materialized_operation_count,
-      mapper_succeeded);
+  bool profiling_succeeded =
+      runMapperForTaskProfile(task, shape, compiled_ii, steps,
+                              materialized_operation_count, mapper_succeeded);
   if (!profiling_succeeded || !mapper_succeeded) {
     return std::nullopt;
   }
@@ -456,12 +442,13 @@ bool TaskProfiler::runMapperForTaskProfile(TaskflowTaskOp task,
   int y_tiles = shape.rows * per_cgra_rows;
   assert(x_tiles > 0 && y_tiles > 0 &&
          "Composed-CGRA profile shape must contain at least one tile.\n");
-  std::string valid_tiles = buildValidTileList(shape);
+  assert(shape.is_rectangular &&
+         "Task profiler should only map rectangular composed-CGRA shapes.\n");
+  std::string valid_tiles;
 
-  LogicalResult result =
-      runMapperOnKernel(source_kernel, x_tiles, y_tiles, valid_tiles,
-                        compiled_ii, steps, materialized_operation_count,
-                        mapper_succeeded);
+  LogicalResult result = runMapperOnKernel(
+      source_kernel, x_tiles, y_tiles, valid_tiles, compiled_ii, steps,
+      materialized_operation_count, mapper_succeeded);
   return succeeded(result);
 }
 
