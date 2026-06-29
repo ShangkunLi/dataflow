@@ -951,9 +951,9 @@ void TaskScheduler::recordScheduleResult(const TaskMemoryGraph &graph) {
       task_result.start_time = std::min(task_result.start_time, pos.start_time);
       task_result.end_time =
           std::max(task_result.end_time, pos.start_time + pos.duration);
-      task_result.cgra_occupancies.push_back(
-          {pos.row, pos.col, pos.start_time, pos.duration, pos.context_id,
-           pos.replica_id});
+      task_result.cgra_occupancies.push_back({pos.row, pos.col, pos.start_time,
+                                              pos.duration, pos.context_id,
+                                              pos.replica_id});
     }
 
     for (TaskNode *pred : task_node->ssa_operands) {

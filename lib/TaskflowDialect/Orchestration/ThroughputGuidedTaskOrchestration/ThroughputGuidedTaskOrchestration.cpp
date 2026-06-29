@@ -128,8 +128,18 @@ void emitTaskOrchestrationSummary(
 
 bool ThroughputGuidedTaskOrchestration::runTaskOrchestration(
     func::FuncOp func) {
-  TaskProfiler profiler;
-  TaskProfileMap profile_map = profiler.profileFunction(func);
+  TaskProfileMap profile_map;
+  if (task_profile_json_.empty()) {
+    TaskProfiler profiler;
+    profile_map = profiler.profileFunction(func);
+  } else {
+    FailureOr<TaskProfileMap> cached_profile_map =
+        TaskProfiler::readTaskProfileMapFromJson(func, task_profile_json_);
+    if (failed(cached_profile_map)) {
+      return false;
+    }
+    profile_map = std::move(*cached_profile_map);
+  }
 
   ResourceAssignmentState assignment_state(func, profile_map);
   std::optional<TaskPipelineIntervalResult> current =
