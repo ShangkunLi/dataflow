@@ -22,14 +22,15 @@ namespace {
 
 std::unique_ptr<Orchestration>
 createOrchestrationStrategy(StringRef strategy_name, int grid_rows,
-                            int grid_cols, SchedulingMode mode) {
+                            int grid_cols, SchedulingMode mode,
+                            StringRef task_profile_json) {
   return llvm::StringSwitch<std::unique_ptr<Orchestration>>(strategy_name)
       .Case("routing-critical-path",
             std::make_unique<RoutingCriticalPathOrchestration>(grid_rows,
                                                                grid_cols, mode))
       .Case("throughput-guided",
             std::make_unique<ThroughputGuidedTaskOrchestration>(
-                grid_rows, grid_cols, mode))
+                grid_rows, grid_cols, mode, task_profile_json.str()))
       .Default(nullptr);
 }
 
@@ -49,10 +50,10 @@ struct OrchestrateTaskOnCgraPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    LLVM::LLVMDialect, func::FuncDialect,
-                    memref::MemRefDialect, neura::NeuraDialect,
-                    scf::SCFDialect, taskflow::TaskflowDialect>();
+    registry
+        .insert<affine::AffineDialect, arith::ArithDialect, LLVM::LLVMDialect,
+                func::FuncDialect, memref::MemRefDialect, neura::NeuraDialect,
+                scf::SCFDialect, taskflow::TaskflowDialect>();
   }
 
   Option<std::string> schedulingMode{
@@ -69,6 +70,13 @@ struct OrchestrateTaskOnCgraPass
                      "(default) or 'throughput-guided'."),
       llvm::cl::init("routing-critical-path")};
 
+  Option<std::string> taskProfileJson{
+      *this, "task-profile-json",
+      llvm::cl::desc("Optional JSON profile cache for throughput-guided "
+                     "orchestration. When provided, task profiles are read "
+                     "from this file instead of invoking the profiler."),
+      llvm::cl::init("")};
+
   void runOnOperation() override {
     SchedulingMode mode = (schedulingMode.getValue() == "spatial")
                               ? SchedulingMode::Spatial
@@ -76,7 +84,7 @@ struct OrchestrateTaskOnCgraPass
     const neura::Architecture &architecture = neura::getArchitecture();
     std::unique_ptr<Orchestration> strategy = createOrchestrationStrategy(
         orchestrationStrategy.getValue(), architecture.getMultiCgraRows(),
-        architecture.getMultiCgraColumns(), mode);
+        architecture.getMultiCgraColumns(), mode, taskProfileJson.getValue());
     if (!strategy) {
       getOperation()->emitError() << "unknown task orchestration strategy: "
                                   << orchestrationStrategy.getValue();

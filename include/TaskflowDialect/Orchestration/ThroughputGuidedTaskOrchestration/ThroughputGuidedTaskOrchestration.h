@@ -6,6 +6,9 @@
 #include "TaskflowDialect/Orchestration/Orchestration.h"
 #include "TaskflowDialect/Orchestration/orchestration_utils.h"
 
+#include <string>
+#include <utility>
+
 namespace mlir {
 namespace taskflow {
 
@@ -20,8 +23,10 @@ class ThroughputGuidedTaskOrchestration : public Orchestration {
 public:
   ThroughputGuidedTaskOrchestration(
       int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
-      SchedulingMode mode = SchedulingMode::SpatialTemporal)
-      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {}
+      SchedulingMode mode = SchedulingMode::SpatialTemporal,
+      std::string task_profile_json = "")
+      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+        task_profile_json_(std::move(task_profile_json)) {}
 
   // Runs throughput-guided task orchestration and emits the selected static
   // task orchestration metadata.
@@ -33,6 +38,7 @@ private:
   int grid_rows_;
   int grid_cols_;
   SchedulingMode mode_;
+  std::string task_profile_json_;
 };
 
 } // namespace taskflow

@@ -6,8 +6,11 @@
 #include "TaskflowDialect/Orchestration/orchestration_utils.h"
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Support/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <optional>
 #include <string>
@@ -43,6 +46,21 @@ public:
   // These profiles are internal search inputs and are not emitted to IR.
   TaskProfileMap profileFunction(func::FuncOp func) const;
 
+  // Profiles every task and writes a JSON profile cache. The file is refreshed
+  // after each completed candidate so long-running profiling can be inspected.
+  LogicalResult profileFunctionToJson(func::FuncOp func,
+                                      llvm::StringRef output_file) const;
+
+  // Writes a completed profile map as a JSON cache.
+  static LogicalResult writeTaskProfileMapToJson(
+      func::FuncOp func, const TaskProfileMap &profile_map,
+      llvm::StringRef output_file);
+
+  // Reads a JSON profile cache and maps entries back to taskflow.task ops by
+  // task name.
+  static FailureOr<TaskProfileMap>
+  readTaskProfileMapFromJson(func::FuncOp func, llvm::StringRef input_file);
+
   // Profiles one task across rectangular composed-CGRA options by invoking
   // the Neura mapper on the task's kernel. Symbol-bound counters use the
   // profiler's configured sample trip count.
@@ -60,6 +78,12 @@ private:
                                int &compiled_ii, int &steps,
                                int &materialized_operation_count,
                                bool &mapper_succeeded) const;
+
+  llvm::SmallVector<TaskProfile> profileTaskWithCandidateCallback(
+      TaskflowTaskOp task,
+      llvm::function_ref<void(int, const CgraShape &, int,
+                              const std::optional<TaskProfile> &)>
+          candidate_callback) const;
 
   int max_composed_cgra_count_;
   int symbol_bound_trip_count_;

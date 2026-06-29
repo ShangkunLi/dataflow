@@ -137,8 +137,46 @@ def OrchestrateTaskOnCgra : Pass<"orchestrate-task-on-cgra", "func::FuncOp"> {
            "orchestrationStrategy", "orchestration-strategy", "std::string",
            /*default=*/"\"routing-critical-path\"",
            "Task orchestration strategy: 'routing-critical-path' (default) or "
-           "'throughput-guided'.">];
+           "'throughput-guided'.">,
+       Option<
+           "taskProfileJson", "task-profile-json", "std::string",
+           /*default=*/"\"\"",
+           "Optional JSON profile cache for throughput-guided orchestration. "
+           "When provided, the strategy reads task candidate profiles from "
+           "this file instead of invoking the profiler.">];
   let constructor = "taskflow::createOrchestrateTaskOnCgraPass()";
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::LLVM::LLVMDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def ProfileTaskCandidates
+    : Pass<"profile-task-candidates", "func::FuncOp"> {
+  let summary =
+      "Profiles Taskflow tasks across composed-CGRA candidates into JSON";
+  let description = [{
+    Runs the throughput-guided TaskProfiler without performing orchestration.
+    The pass profiles every taskflow.task across rectangular composed-CGRA
+    candidates and writes a reusable JSON cache. The file is refreshed after
+    every completed candidate so long-running benchmark profiling can be
+    inspected while it is still running.
+  }];
+  let options =
+      [Option<"outputJson", "output-json", "std::string",
+              /*default=*/"\"\"",
+              "Output JSON file for task candidate profiles.">,
+       Option<"maxComposedCgraCount", "max-composed-cgra-count", "int",
+              /*default=*/"4",
+              "Maximum composed-CGRA candidate size to profile.">,
+       Option<"symbolBoundTripCount", "symbol-bound-trip-count", "int",
+              /*default=*/"256",
+              "Sample trip count used for symbol-bound taskflow counters.">];
+  let constructor = "taskflow::createProfileTaskCandidatesPass()";
   let dependentDialects = ["mlir::affine::AffineDialect",
                            "mlir::arith::ArithDialect",
                            "mlir::LLVM::LLVMDialect",

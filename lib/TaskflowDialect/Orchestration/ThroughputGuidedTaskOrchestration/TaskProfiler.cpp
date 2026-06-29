@@ -22,7 +22,13 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -32,6 +38,230 @@
 
 namespace mlir {
 namespace taskflow {
+
+namespace {
+
+struct ProfileJsonProgress {
+  int expected_candidate_count = -1;
+  int completed_candidate_count = -1;
+  std::string last_task;
+  int last_candidate_index = -1;
+  int last_composed_cgra_count = -1;
+  std::string last_shape;
+  bool last_mapper_succeeded = false;
+};
+
+void writeJsonString(raw_ostream &os, StringRef value) {
+  os << "\"";
+  for (char c : value) {
+    switch (c) {
+    case '"':
+      os << "\\\"";
+      break;
+    case '\\':
+      os << "\\\\";
+      break;
+    case '\b':
+      os << "\\b";
+      break;
+    case '\f':
+      os << "\\f";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      os << c;
+      break;
+    }
+  }
+  os << "\"";
+}
+
+std::string getTaskProfileName(TaskflowTaskOp task) {
+  return task.getTaskName().str();
+}
+
+void writeTaskProfile(raw_ostream &os, const TaskProfile &profile,
+                      StringRef indent) {
+  os << indent << "{\n";
+  os << indent << "  \"composed_cgra_count\": "
+     << profile.composed_cgra_count << ",\n";
+  os << indent << "  \"composed_cgra_shape\": ";
+  writeJsonString(os, profile.composed_cgra_shape);
+  os << ",\n";
+  os << indent << "  \"compiled_ii\": " << profile.compiled_ii << ",\n";
+  os << indent << "  \"steps\": " << profile.steps << ",\n";
+  os << indent << "  \"sample_trip_count\": " << profile.sample_trip_count
+     << ",\n";
+  os << indent << "  \"materialized_operation_count\": "
+     << profile.materialized_operation_count << ",\n";
+  os << indent << "  \"estimated_latency\": " << profile.estimated_latency
+     << ",\n";
+  os << indent << "  \"mapper_succeeded\": "
+     << (profile.mapper_succeeded ? "true" : "false") << "\n";
+  os << indent << "}";
+}
+
+LogicalResult writeTaskProfileMapToJsonImpl(
+    func::FuncOp func, const TaskProfileMap &profile_map,
+    StringRef output_file, const ProfileJsonProgress *progress) {
+  std::error_code error;
+  llvm::raw_fd_ostream os(output_file, error);
+  if (error) {
+    func.emitError() << "failed to open task profile JSON file '"
+                     << output_file << "': " << error.message();
+    return failure();
+  }
+
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+
+  os << "{\n";
+  os << "  \"format\": \"amoeba-task-profile-v1\",\n";
+  os << "  \"function\": ";
+  writeJsonString(os, func.getSymName());
+  os << ",\n";
+  os << "  \"task_count\": " << tasks.size() << ",\n";
+  if (progress) {
+    os << "  \"expected_candidate_count\": "
+       << progress->expected_candidate_count << ",\n";
+    os << "  \"completed_candidate_count\": "
+       << progress->completed_candidate_count << ",\n";
+    os << "  \"last_completed_candidate\": ";
+    if (progress->last_task.empty()) {
+      os << "null";
+    } else {
+      os << "{\n";
+      os << "    \"task\": ";
+      writeJsonString(os, progress->last_task);
+      os << ",\n";
+      os << "    \"candidate_index_in_task\": "
+         << progress->last_candidate_index << ",\n";
+      os << "    \"composed_cgra_count\": "
+         << progress->last_composed_cgra_count << ",\n";
+      os << "    \"shape\": ";
+      writeJsonString(os, progress->last_shape);
+      os << ",\n";
+      os << "    \"mapper_succeeded\": "
+         << (progress->last_mapper_succeeded ? "true" : "false") << "\n";
+      os << "  }";
+    }
+    os << ",\n";
+  }
+
+  os << "  \"tasks\": [\n";
+  for (auto [task_index, task] : llvm::enumerate(tasks)) {
+    os << "    {\n";
+    os << "      \"task\": ";
+    writeJsonString(os, getTaskProfileName(task));
+    os << ",\n";
+    os << "      \"profiles\": [\n";
+
+    auto it = profile_map.find(task);
+    ArrayRef<TaskProfile> profiles;
+    if (it != profile_map.end()) {
+      profiles = it->second;
+    }
+    for (auto [profile_index, profile] : llvm::enumerate(profiles)) {
+      writeTaskProfile(os, profile, "        ");
+      if (profile_index + 1 != profiles.size()) {
+        os << ",";
+      }
+      os << "\n";
+    }
+
+    os << "      ]\n";
+    os << "    }";
+    if (task_index + 1 != tasks.size()) {
+      os << ",";
+    }
+    os << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+  return success();
+}
+
+std::optional<int> readRequiredJsonInt(TaskflowTaskOp task,
+                                       const llvm::json::Object &object,
+                                       StringRef key) {
+  std::optional<int64_t> value = object.getInteger(key);
+  if (!value) {
+    task.emitError() << "task profile JSON entry requires integer key '" << key
+                     << "'";
+    return std::nullopt;
+  }
+  if (*value < std::numeric_limits<int>::min() ||
+      *value > std::numeric_limits<int>::max()) {
+    task.emitError() << "task profile JSON integer key '" << key
+                     << "' exceeds int range";
+    return std::nullopt;
+  }
+  return static_cast<int>(*value);
+}
+
+std::optional<TaskProfile>
+readTaskProfileFromJson(TaskflowTaskOp task, const llvm::json::Object &object) {
+  TaskProfile profile;
+  std::optional<int> composed_cgra_count =
+      readRequiredJsonInt(task, object, "composed_cgra_count");
+  std::optional<StringRef> composed_cgra_shape =
+      object.getString("composed_cgra_shape");
+  std::optional<int> compiled_ii =
+      readRequiredJsonInt(task, object, "compiled_ii");
+  std::optional<int> steps = readRequiredJsonInt(task, object, "steps");
+  std::optional<int> sample_trip_count =
+      readRequiredJsonInt(task, object, "sample_trip_count");
+  std::optional<int> materialized_operation_count =
+      readRequiredJsonInt(task, object, "materialized_operation_count");
+  std::optional<int> estimated_latency =
+      readRequiredJsonInt(task, object, "estimated_latency");
+  std::optional<bool> mapper_succeeded = object.getBoolean("mapper_succeeded");
+
+  if (!composed_cgra_count || !composed_cgra_shape || !compiled_ii || !steps ||
+      !sample_trip_count || !materialized_operation_count ||
+      !estimated_latency || !mapper_succeeded) {
+    if (!composed_cgra_shape) {
+      task.emitError()
+          << "task profile JSON entry requires string key "
+             "'composed_cgra_shape'";
+    }
+    if (!mapper_succeeded) {
+      task.emitError()
+          << "task profile JSON entry requires boolean key "
+             "'mapper_succeeded'";
+    }
+    return std::nullopt;
+  }
+
+  profile.composed_cgra_count = *composed_cgra_count;
+  profile.composed_cgra_shape = composed_cgra_shape->str();
+  profile.compiled_ii = *compiled_ii;
+  profile.steps = *steps;
+  profile.sample_trip_count = *sample_trip_count;
+  profile.materialized_operation_count = *materialized_operation_count;
+  profile.estimated_latency = *estimated_latency;
+  profile.mapper_succeeded = *mapper_succeeded;
+
+  if (profile.composed_cgra_count <= 0 || profile.compiled_ii <= 0 ||
+      profile.steps <= 0 || profile.sample_trip_count <= 0 ||
+      profile.materialized_operation_count <= 0 ||
+      profile.estimated_latency <= 0 || !profile.mapper_succeeded) {
+    task.emitError() << "task profile JSON entry contains invalid profile "
+                        "values";
+    return std::nullopt;
+  }
+  return profile;
+}
+
+} // namespace
 
 static std::optional<int64_t> getConstantIndex(Value value) {
   if (auto cst = value.getDefiningOp<arith::ConstantIndexOp>()) {
@@ -343,12 +573,211 @@ TaskProfileMap TaskProfiler::profileFunction(func::FuncOp func) const {
   return profile_map;
 }
 
+LogicalResult TaskProfiler::profileFunctionToJson(
+    func::FuncOp func, llvm::StringRef output_file) const {
+  TaskProfileMap profile_map;
+
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+
+  int candidates_per_task = 0;
+  for (int cgra_count = 1; cgra_count <= max_composed_cgra_count_;
+       ++cgra_count) {
+    for (const CgraShape &shape : getAllPlacementShapes(cgra_count)) {
+      if (shape.is_rectangular) {
+        ++candidates_per_task;
+      }
+    }
+  }
+
+  ProfileJsonProgress progress;
+  progress.expected_candidate_count =
+      candidates_per_task * static_cast<int>(tasks.size());
+  progress.completed_candidate_count = 0;
+  if (failed(
+          writeTaskProfileMapToJsonImpl(func, profile_map, output_file,
+                                        &progress))) {
+    return failure();
+  }
+
+  for (TaskflowTaskOp task : tasks) {
+    auto &profiles = profile_map[task];
+    bool write_failed = false;
+    llvm::SmallVector<TaskProfile> task_profiles =
+        profileTaskWithCandidateCallback(
+            task,
+            [&](int candidate_index, const CgraShape &shape,
+                int composed_cgra_count,
+                const std::optional<TaskProfile> &profile) {
+              ++progress.completed_candidate_count;
+              progress.last_task = getTaskProfileName(task);
+              progress.last_candidate_index = candidate_index;
+              progress.last_composed_cgra_count = composed_cgra_count;
+              progress.last_shape = shape.irAttr();
+              progress.last_mapper_succeeded =
+                  profile && profile->mapper_succeeded;
+              if (profile) {
+                profiles.push_back(*profile);
+              }
+              if (failed(writeTaskProfileMapToJsonImpl(
+                      func, profile_map, output_file, &progress))) {
+                write_failed = true;
+              }
+            });
+    if (write_failed) {
+      return failure();
+    }
+    assert(task_profiles.size() == profiles.size() &&
+           "Incremental JSON profile cache should match profiler results.\n");
+  }
+  return writeTaskProfileMapToJsonImpl(func, profile_map, output_file,
+                                       &progress);
+}
+
+LogicalResult TaskProfiler::writeTaskProfileMapToJson(
+    func::FuncOp func, const TaskProfileMap &profile_map,
+    llvm::StringRef output_file) {
+  return writeTaskProfileMapToJsonImpl(func, profile_map, output_file,
+                                       /*progress=*/nullptr);
+}
+
+FailureOr<TaskProfileMap>
+TaskProfiler::readTaskProfileMapFromJson(func::FuncOp func,
+                                         llvm::StringRef input_file) {
+  auto buffer = llvm::MemoryBuffer::getFile(input_file);
+  if (!buffer) {
+    func.emitError() << "failed to open task profile JSON file '" << input_file
+                     << "': " << buffer.getError().message();
+    return failure();
+  }
+
+  llvm::Expected<llvm::json::Value> parsed =
+      llvm::json::parse((*buffer)->getBuffer());
+  if (!parsed) {
+    std::string error_message;
+    llvm::raw_string_ostream os(error_message);
+    llvm::logAllUnhandledErrors(parsed.takeError(), os);
+    func.emitError() << "failed to parse task profile JSON file '"
+                     << input_file << "': " << os.str();
+    return failure();
+  }
+
+  llvm::json::Object *root = parsed->getAsObject();
+  if (!root) {
+    func.emitError() << "task profile JSON root must be an object";
+    return failure();
+  }
+
+  std::optional<StringRef> format = root->getString("format");
+  if (!format || *format != "amoeba-task-profile-v1") {
+    func.emitError() << "task profile JSON requires format "
+                        "'amoeba-task-profile-v1'";
+    return failure();
+  }
+
+  std::optional<StringRef> function_name = root->getString("function");
+  if (function_name && *function_name != func.getSymName()) {
+    func.emitError() << "task profile JSON was generated for function '"
+                     << *function_name << "', not '" << func.getSymName()
+                     << "'";
+    return failure();
+  }
+
+  llvm::StringMap<TaskflowTaskOp> task_by_name;
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) {
+    std::string task_name = getTaskProfileName(task);
+    task_by_name[task_name] = task;
+    tasks.push_back(task);
+  });
+
+  llvm::json::Array *task_entries = root->getArray("tasks");
+  if (!task_entries) {
+    func.emitError() << "task profile JSON requires a tasks array";
+    return failure();
+  }
+
+  TaskProfileMap profile_map;
+  llvm::DenseSet<Operation *> seen_tasks;
+  for (llvm::json::Value &task_value : *task_entries) {
+    llvm::json::Object *task_object = task_value.getAsObject();
+    if (!task_object) {
+      func.emitError() << "task profile JSON tasks entries must be objects";
+      return failure();
+    }
+
+    std::optional<StringRef> task_name = task_object->getString("task");
+    if (!task_name) {
+      func.emitError() << "task profile JSON task entry requires task name";
+      return failure();
+    }
+
+    auto task_it = task_by_name.find(*task_name);
+    if (task_it == task_by_name.end()) {
+      func.emitError() << "task profile JSON contains unknown task '"
+                       << *task_name << "'";
+      return failure();
+    }
+    TaskflowTaskOp task = task_it->second;
+
+    llvm::json::Array *profile_entries = task_object->getArray("profiles");
+    if (!profile_entries) {
+      task.emitError() << "task profile JSON task entry requires profiles "
+                          "array";
+      return failure();
+    }
+
+    auto &profiles = profile_map[task];
+    for (llvm::json::Value &profile_value : *profile_entries) {
+      llvm::json::Object *profile_object = profile_value.getAsObject();
+      if (!profile_object) {
+        task.emitError()
+            << "task profile JSON profile entries must be objects";
+        return failure();
+      }
+      std::optional<TaskProfile> profile =
+          readTaskProfileFromJson(task, *profile_object);
+      if (!profile) {
+        return failure();
+      }
+      profiles.push_back(std::move(*profile));
+    }
+
+    if (profiles.empty()) {
+      task.emitError() << "task profile JSON contains no valid profiles for "
+                          "this task";
+      return failure();
+    }
+    seen_tasks.insert(task.getOperation());
+  }
+
+  for (TaskflowTaskOp task : tasks) {
+    if (!seen_tasks.contains(task.getOperation())) {
+      task.emitError() << "task profile JSON is missing this task";
+      return failure();
+    }
+  }
+  return profile_map;
+}
+
 llvm::SmallVector<TaskProfile>
 TaskProfiler::profileTask(TaskflowTaskOp task) const {
+  return profileTaskWithCandidateCallback(
+      task, [](int, const CgraShape &, int,
+               const std::optional<TaskProfile> &) {});
+}
+
+llvm::SmallVector<TaskProfile>
+TaskProfiler::profileTaskWithCandidateCallback(
+    TaskflowTaskOp task,
+    llvm::function_ref<void(int, const CgraShape &, int,
+                            const std::optional<TaskProfile> &)>
+        candidate_callback) const {
   llvm::SmallVector<TaskProfile> profiles;
   assert(taskContainsNeuraKernel(task) && "Each task must contain a "
                                           "neura.kernel for profiling.\n");
 
+  int candidate_index = 0;
   for (int cgra_count = 1; cgra_count <= max_composed_cgra_count_;
        ++cgra_count) {
     for (const CgraShape &shape : getAllPlacementShapes(cgra_count)) {
@@ -358,8 +787,10 @@ TaskProfiler::profileTask(TaskflowTaskOp task) const {
       if (!shape.is_rectangular) {
         continue;
       }
+      ++candidate_index;
       std::optional<TaskProfile> profile =
           profileTaskOnComposedCgra(task, shape, cgra_count);
+      candidate_callback(candidate_index, shape, cgra_count, profile);
       if (profile) {
         profiles.push_back(std::move(*profile));
       }
