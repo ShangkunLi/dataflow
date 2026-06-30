@@ -26,12 +26,13 @@ struct OrchestrationMove {
 
 std::optional<TaskPipelineIntervalResult> evaluateResourceAssignment(
     func::FuncOp func, ResourceAssignmentState &assignment_state, int grid_rows,
-    int grid_cols, SchedulingMode mode, llvm::StringRef evaluation_name,
+    int grid_cols, SchedulingMode mode, int max_contexts_per_cgra,
+    llvm::StringRef evaluation_name,
     llvm::ArrayRef<TaskflowTaskOp> priority_path = {}) {
   assignment_state.applyCurrentResourceAssignment();
 
   TaskPriorityMap priority = assignment_state.buildTaskPriority(priority_path);
-  TaskScheduler scheduler(grid_rows, grid_cols, mode);
+  TaskScheduler scheduler(grid_rows, grid_cols, mode, max_contexts_per_cgra);
   if (!scheduler.schedule(func, priority)) {
     func.emitError() << evaluation_name << " task schedule failed";
     return std::nullopt;
@@ -54,25 +55,25 @@ buildBottleneckMoves(const ResourceAssignmentState &assignment_state,
     return moves;
   }
 
-  std::optional<int> profile_index =
-      assignment_state.getNextLargerComposedCgraProfile(task_index);
-  if (profile_index) {
-    OrchestrationMove move;
-    move.kind = OrchestrationMove::Kind::ExpandComposedCgra;
-    move.task_index = task_index;
-    move.profile_index = *profile_index;
-    moves.push_back(move);
-  }
+  // std::optional<int> profile_index =
+  //     assignment_state.getNextLargerComposedCgraProfile(task_index);
+  // if (profile_index) {
+  //   OrchestrationMove move;
+  //   move.kind = OrchestrationMove::Kind::ExpandComposedCgra;
+  //   move.task_index = task_index;
+  //   move.profile_index = *profile_index;
+  //   moves.push_back(move);
+  // }
 
-  std::optional<int> replica_count =
-      assignment_state.getNextReplicaCount(task_index);
-  if (replica_count) {
-    OrchestrationMove move;
-    move.kind = OrchestrationMove::Kind::IncreaseReplica;
-    move.task_index = task_index;
-    move.replica_count = *replica_count;
-    moves.push_back(move);
-  }
+  // std::optional<int> replica_count =
+  //     assignment_state.getNextReplicaCount(task_index);
+  // if (replica_count) {
+  //   OrchestrationMove move;
+  //   move.kind = OrchestrationMove::Kind::IncreaseReplica;
+  //   move.task_index = task_index;
+  //   move.replica_count = *replica_count;
+  //   moves.push_back(move);
+  // }
 
   return moves;
 }
@@ -144,7 +145,8 @@ bool ThroughputGuidedTaskOrchestration::runTaskOrchestration(
   ResourceAssignmentState assignment_state(func, profile_map);
   std::optional<TaskPipelineIntervalResult> current =
       evaluateResourceAssignment(func, assignment_state, grid_rows_, grid_cols_,
-                                 mode_, "initial throughput-guided");
+                                 mode_, max_contexts_per_cgra_,
+                                 "initial throughput-guided");
   if (!current) {
     return false;
   }
@@ -165,9 +167,10 @@ bool ThroughputGuidedTaskOrchestration::runTaskOrchestration(
       ResourceAssignmentState speculative_state = assignment_state;
       applyMove(speculative_state, move);
       std::optional<TaskPipelineIntervalResult> speculative =
-          evaluateResourceAssignment(
-              func, speculative_state, grid_rows_, grid_cols_, mode_,
-              "speculative throughput-guided", current->critical_path);
+          evaluateResourceAssignment(func, speculative_state, grid_rows_,
+                                     grid_cols_, mode_, max_contexts_per_cgra_,
+                                     "speculative throughput-guided",
+                                     current->critical_path);
       if (!speculative) {
         continue;
       }
@@ -188,7 +191,8 @@ bool ThroughputGuidedTaskOrchestration::runTaskOrchestration(
 
   std::optional<TaskPipelineIntervalResult> final_result =
       evaluateResourceAssignment(func, assignment_state, grid_rows_, grid_cols_,
-                                 mode_, "final throughput-guided",
+                                 mode_, max_contexts_per_cgra_,
+                                 "final throughput-guided",
                                  current->critical_path);
   if (!final_result) {
     return false;

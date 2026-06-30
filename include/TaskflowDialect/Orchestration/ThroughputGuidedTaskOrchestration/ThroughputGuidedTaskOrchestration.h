@@ -24,9 +24,11 @@ public:
   ThroughputGuidedTaskOrchestration(
       int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
       SchedulingMode mode = SchedulingMode::SpatialTemporal,
-      std::string task_profile_json = "")
+      std::string task_profile_json = "",
+      int max_contexts_per_cgra = kDefaultMaxContextsPerCgra)
       : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
-        task_profile_json_(std::move(task_profile_json)) {}
+        task_profile_json_(std::move(task_profile_json)),
+        max_contexts_per_cgra_(max_contexts_per_cgra) {}
 
   // Runs throughput-guided task orchestration and emits the selected static
   // task orchestration metadata.
@@ -39,6 +41,7 @@ private:
   int grid_cols_;
   SchedulingMode mode_;
   std::string task_profile_json_;
+  int max_contexts_per_cgra_ = kDefaultMaxContextsPerCgra;
 };
 
 } // namespace taskflow

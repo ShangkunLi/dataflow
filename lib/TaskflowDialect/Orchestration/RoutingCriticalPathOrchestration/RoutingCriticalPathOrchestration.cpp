@@ -87,7 +87,8 @@ RoutingCriticalPathOrchestration::computeRoutingCriticalPathPriority(
 
 bool RoutingCriticalPathOrchestration::runTaskOrchestration(func::FuncOp func) {
   TaskPriorityMap priority = computeRoutingCriticalPathPriority(func);
-  TaskScheduler scheduler(grid_rows_, grid_cols_, mode_);
+  TaskScheduler scheduler(grid_rows_, grid_cols_, mode_,
+                          max_contexts_per_cgra_);
   return scheduler.schedule(func, priority);
 }
 

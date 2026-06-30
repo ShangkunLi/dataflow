@@ -20,17 +20,17 @@ using namespace mlir::taskflow;
 
 namespace {
 
-std::unique_ptr<Orchestration>
-createOrchestrationStrategy(StringRef strategy_name, int grid_rows,
-                            int grid_cols, SchedulingMode mode,
-                            StringRef task_profile_json) {
+std::unique_ptr<Orchestration> createOrchestrationStrategy(
+    StringRef strategy_name, int grid_rows, int grid_cols, SchedulingMode mode,
+    StringRef task_profile_json, int max_contexts_per_cgra) {
   return llvm::StringSwitch<std::unique_ptr<Orchestration>>(strategy_name)
       .Case("routing-critical-path",
-            std::make_unique<RoutingCriticalPathOrchestration>(grid_rows,
-                                                               grid_cols, mode))
+            std::make_unique<RoutingCriticalPathOrchestration>(
+                grid_rows, grid_cols, mode, max_contexts_per_cgra))
       .Case("throughput-guided",
             std::make_unique<ThroughputGuidedTaskOrchestration>(
-                grid_rows, grid_cols, mode, task_profile_json.str()))
+                grid_rows, grid_cols, mode, task_profile_json.str(),
+                max_contexts_per_cgra))
       .Default(nullptr);
 }
 
@@ -84,7 +84,8 @@ struct OrchestrateTaskOnCgraPass
     const neura::Architecture &architecture = neura::getArchitecture();
     std::unique_ptr<Orchestration> strategy = createOrchestrationStrategy(
         orchestrationStrategy.getValue(), architecture.getMultiCgraRows(),
-        architecture.getMultiCgraColumns(), mode, taskProfileJson.getValue());
+        architecture.getMultiCgraColumns(), mode, taskProfileJson.getValue(),
+        architecture.getMaxContextMemItems());
     if (!strategy) {
       getOperation()->emitError() << "unknown task orchestration strategy: "
                                   << orchestrationStrategy.getValue();

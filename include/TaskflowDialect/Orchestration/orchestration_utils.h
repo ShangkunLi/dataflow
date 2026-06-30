@@ -22,6 +22,7 @@ namespace taskflow {
 
 constexpr int kCgraGridRows = 4;
 constexpr int kCgraGridCols = 4;
+constexpr int kDefaultMaxContextsPerCgra = 12;
 
 // CgraShape.
 
@@ -236,7 +237,8 @@ private:
 class TaskScheduler {
 public:
   TaskScheduler(int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
-                SchedulingMode mode = SchedulingMode::SpatialTemporal);
+                SchedulingMode mode = SchedulingMode::SpatialTemporal,
+                int max_contexts_per_cgra = kDefaultMaxContextsPerCgra);
 
   // Schedules and places all Taskflow tasks in `func` using the caller-provided
   // task priority map.
@@ -263,6 +265,10 @@ private:
   // Returns true if a CGRA cell is already occupied during the requested
   // time interval.
   bool isOccupied(int row, int col, int start_time, int duration) const;
+
+  // Returns true if assigning another task context to this CGRA would stay
+  // within the architecture's per-CGRA task context-memory capacity.
+  bool hasAvailableContextSlot(int row, int col) const;
 
   // Marks a CGRA cell as occupied for the half-open interval
   // [start_time, start_time + duration).
@@ -301,6 +307,7 @@ private:
   SchedulingMode mode_;
   int total_task_count_ = 0;
   int schedule_time_scale_ = 1;
+  int max_contexts_per_cgra_ = kDefaultMaxContextsPerCgra;
   llvm::SmallVector<TaskScheduleResult> schedule_result_;
   std::vector<std::vector<llvm::SmallVector<std::pair<int, int>, 4>>>
       cgra_occupancy_;

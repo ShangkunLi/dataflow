@@ -26,8 +26,10 @@ class RoutingCriticalPathOrchestration : public Orchestration {
 public:
   RoutingCriticalPathOrchestration(
       int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
-      SchedulingMode mode = SchedulingMode::SpatialTemporal)
-      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {}
+      SchedulingMode mode = SchedulingMode::SpatialTemporal,
+      int max_contexts_per_cgra = kDefaultMaxContextsPerCgra)
+      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+        max_contexts_per_cgra_(max_contexts_per_cgra) {}
 
   // Places all taskflow.task ops in `func` onto the grid, annotating each
   // with a `task_orchestration_info` attribute.  Returns true on success.
@@ -59,6 +61,7 @@ private:
   int grid_rows_;
   int grid_cols_;
   SchedulingMode mode_;
+  int max_contexts_per_cgra_ = kDefaultMaxContextsPerCgra;
 };
 
 } // namespace taskflow

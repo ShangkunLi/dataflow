@@ -638,8 +638,12 @@ TaskPipelineIntervalAnalyzer::computeLongestPipelineCycle() const {
 // In SpatialTemporal mode, ASAP scheduling is applied via
 // computeEarliestStartTime() so that each ready task starts as soon as all
 // explicit taskflow dependencies have completed.
-TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode)
-    : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {
+TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode,
+                             int max_contexts_per_cgra)
+    : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+      max_contexts_per_cgra_(max_contexts_per_cgra) {
+  assert(max_contexts_per_cgra_ > 0 &&
+         "Per-CGRA context capacity must be positive.\n");
   cgra_occupancy_.resize(grid_rows_);
   for (auto &row : cgra_occupancy_) {
     row.resize(grid_cols_);
@@ -802,6 +806,13 @@ bool TaskScheduler::schedule(func::FuncOp func,
   for (int r = 0; r < grid_rows_; ++r) {
     for (int c = 0; c < grid_cols_; ++c) {
       auto &tasks_at_cell = cell_tasks[r][c];
+      if (static_cast<int>(tasks_at_cell.size()) > max_contexts_per_cgra_) {
+        func.emitError() << "CGRA(" << r << ", " << c << ") requires "
+                         << tasks_at_cell.size()
+                         << " task contexts, exceeding context capacity "
+                         << max_contexts_per_cgra_;
+        return false;
+      }
       std::stable_sort(tasks_at_cell.begin(), tasks_at_cell.end(),
                        [](const TaskInterval &a, const TaskInterval &b) {
                          return a.first < b.first;
@@ -1015,6 +1026,11 @@ bool TaskScheduler::isOccupied(int row, int col, int start_time,
   return false;
 }
 
+bool TaskScheduler::hasAvailableContextSlot(int row, int col) const {
+  return static_cast<int>(cgra_occupancy_[row][col].size()) <
+         max_contexts_per_cgra_;
+}
+
 void TaskScheduler::markOccupied(int row, int col, int start_time,
                                  int duration) {
   cgra_occupancy_[row][col].push_back({start_time, start_time + duration});
@@ -1151,6 +1167,7 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
             int abs_col = origin_col + col_off;
             if (abs_row < 0 || abs_row >= grid_rows_ || abs_col < 0 ||
                 abs_col >= grid_cols_ ||
+                !hasAvailableContextSlot(abs_row, abs_col) ||
                 isOccupied(abs_row, abs_col, t_start_int, task_duration)) {
               valid = false;
               break;
