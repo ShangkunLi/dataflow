@@ -55,25 +55,25 @@ buildBottleneckMoves(const ResourceAssignmentState &assignment_state,
     return moves;
   }
 
-  // std::optional<int> profile_index =
-  //     assignment_state.getNextLargerComposedCgraProfile(task_index);
-  // if (profile_index) {
-  //   OrchestrationMove move;
-  //   move.kind = OrchestrationMove::Kind::ExpandComposedCgra;
-  //   move.task_index = task_index;
-  //   move.profile_index = *profile_index;
-  //   moves.push_back(move);
-  // }
+  std::optional<int> profile_index =
+      assignment_state.getNextLargerComposedCgraProfile(task_index);
+  if (profile_index) {
+    OrchestrationMove move;
+    move.kind = OrchestrationMove::Kind::ExpandComposedCgra;
+    move.task_index = task_index;
+    move.profile_index = *profile_index;
+    moves.push_back(move);
+  }
 
-  // std::optional<int> replica_count =
-  //     assignment_state.getNextReplicaCount(task_index);
-  // if (replica_count) {
-  //   OrchestrationMove move;
-  //   move.kind = OrchestrationMove::Kind::IncreaseReplica;
-  //   move.task_index = task_index;
-  //   move.replica_count = *replica_count;
-  //   moves.push_back(move);
-  // }
+  std::optional<int> replica_count =
+      assignment_state.getNextReplicaCount(task_index);
+  if (replica_count) {
+    OrchestrationMove move;
+    move.kind = OrchestrationMove::Kind::IncreaseReplica;
+    move.task_index = task_index;
+    move.replica_count = *replica_count;
+    moves.push_back(move);
+  }
 
   return moves;
 }

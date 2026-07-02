@@ -227,6 +227,13 @@ void handleKernelIterArgs(neura::KernelOp kernel_op, Block *entry_block,
 //---------------------------------------------------------------------------
 // Handles kernel yield with counter-based gating.
 //---------------------------------------------------------------------------
+void moveYieldToBlockEnd(neura::YieldOp yield_op, Block *entry_block) {
+  if (yield_op->getBlock() == entry_block &&
+      yield_op.getOperation() != &entry_block->back()) {
+    yield_op->moveBefore(entry_block, entry_block->end());
+  }
+}
+
 void handleKernelYieldTermination(
     neura::KernelOp kernel_op, Block *entry_block, OpBuilder &builder,
     bool has_task_counter, const SmallVector<Value> &iter_arg_phi_values) {
@@ -311,7 +318,8 @@ void handleKernelYieldTermination(
                                                              gated_results);
       llvm::errs() << "[yield]   Created return_value with counter gating\n";
       builder.setInsertionPointAfter(return_val);
-      builder.create<neura::YieldOp>(builder.getUnknownLoc());
+      auto new_yield = builder.create<neura::YieldOp>(builder.getUnknownLoc());
+      moveYieldToBlockEnd(new_yield, entry_block);
 
     } else {
       llvm::errs() << "[yield]   No counter, handled as normal case.\n";
@@ -323,6 +331,7 @@ void handleKernelYieldTermination(
   //--------------------------------------------------------------------------
   else if (yield_type == "void") {
     llvm::errs() << "[yield] Processing VOID yield\n";
+    moveYieldToBlockEnd(yield_op, entry_block);
   }
   llvm::errs() << "[yield] ========================================\n\n";
 }
