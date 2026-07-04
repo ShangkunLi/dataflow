@@ -28,13 +28,16 @@ std::optional<TaskPipelineIntervalResult> evaluateResourceAssignment(
     func::FuncOp func, ResourceAssignmentState &assignment_state, int grid_rows,
     int grid_cols, SchedulingMode mode, int max_contexts_per_cgra,
     llvm::StringRef evaluation_name,
-    llvm::ArrayRef<TaskflowTaskOp> priority_path = {}) {
+    llvm::ArrayRef<TaskflowTaskOp> priority_path = {},
+    bool emit_schedule_failure = true) {
   assignment_state.applyCurrentResourceAssignment();
 
   TaskPriorityMap priority = assignment_state.buildTaskPriority(priority_path);
   TaskScheduler scheduler(grid_rows, grid_cols, mode, max_contexts_per_cgra);
   if (!scheduler.schedule(func, priority)) {
-    func.emitError() << evaluation_name << " task schedule failed";
+    if (emit_schedule_failure) {
+      func.emitError() << evaluation_name << " task schedule failed";
+    }
     return std::nullopt;
   }
 
@@ -170,7 +173,8 @@ bool ThroughputGuidedTaskOrchestration::runTaskOrchestration(
           evaluateResourceAssignment(func, speculative_state, grid_rows_,
                                      grid_cols_, mode_, max_contexts_per_cgra_,
                                      "speculative throughput-guided",
-                                     current->critical_path);
+                                     current->critical_path,
+                                     /*emit_schedule_failure=*/false);
       if (!speculative) {
         continue;
       }
