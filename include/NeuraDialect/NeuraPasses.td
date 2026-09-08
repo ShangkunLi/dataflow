@@ -137,9 +137,8 @@ def PromoteInputArgToConst : Pass<"promote-input-arg-to-const", "ModuleOp"> {
                 "neura constant operations";
   let description = [{
     This pass promotes input arguments of functions or neura.kernels to
-    neura.constant operations. For template kernels, arguments explicitly bound
-    to input ports remain block arguments so that TemplateMapping can inject
-    them through TileArray boundary ports.
+    neura.constant operations. Inputs referenced only by template configuration
+    remain kernel inputs and do not consume a Tile as constant operations.
   }];
   let constructor = "neura::createPromoteInputArgToConstPass()";
 }

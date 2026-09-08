@@ -676,9 +676,7 @@ bool mlir::neura::tryRouteDataMove(Operation *mov_op, MappingLoc src_loc,
   }
 
   // No routing resource is required when data is already at the destination
-  // tile at the exact time it is consumed. Outer mapping algorithms (e.g.,
-  // TemplateMapping) can encounter this case after injecting data through a
-  // port attached to the consumer tile.
+  // tile at the exact time it is consumed.
   if (src_tile == dst_tile && src_loc.time_step == exclusive_deadline_step) {
     return true;
   }
@@ -1277,9 +1275,7 @@ bool mlir::neura::placeAndRoute(Operation *op, const MappingLoc &target_loc,
       assert(isa<neura::DataMovOp>(data_move) &&
              "Expected a DataMovOp as operand for non-ReserveOp operations");
 
-      // A specialized mapping strategy (e.g., TemplateMapping) may route an
-      // operand before invoking this shared placement implementation. Reuse
-      // that route instead of trying to discover and route its producer again.
+      // Reuses an operand route already reserved by this mapping attempt.
       const std::vector<MappingLoc> &existing_route =
           mapping_state.getAllLocsOfOp(data_move);
 
@@ -1296,12 +1292,10 @@ bool mlir::neura::placeAndRoute(Operation *op, const MappingLoc &target_loc,
 
       Operation *producer = getMaterializedProducer(operand);
 
-      // A block argument has no defining operation. A mapping strategy that
-      // supports external inputs must route this DataMovOp before calling
-      // placeAndRoute.
+      // Every dynamic operand needs a materialized producer.
       if (!producer) {
         data_move->emitError(
-            "external input was not routed by the selected mapping strategy");
+            "input has no mapped producer; lower kernel inputs before mapping");
 
         mapping_state.unbindOp(op);
         for (Operation *routed_op : routed_operands) {

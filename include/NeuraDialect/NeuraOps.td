@@ -293,13 +293,29 @@ def Neura_FCmpOp : Op<NeuraDialect, "fcmp"> {
 
 // Defines a load operation.
 def Neura_LoadOp : Op<NeuraDialect, "load"> {
-  let arguments = (ins AnyType:$addr);
+  let description = [{
+    Loads from a dynamic address, or from a configured address queue.
+    The configured form has no dynamic address operand and carries
+    memory_access = {kernel_input = N : i32, offsets = array<i64: ...>}.
+    Offsets are ordered element offsets relative to the selected kernel
+    memref input, not host pointers or byte addresses. Lowering this configuration
+    requires binding the SRAM base and installing the queue in the memory Tile.
+    Each firing
+    consumes one queue entry; the queue advances on operation completion.
+  }];
+  let arguments = (ins Optional<AnyType>:$addr);
   let results = (outs AnyType:$value);
   // let assemblyFormat = "$addr `,` attr-dict `:` type($value)";
 }
 
 // Defines a store operation.
 def Neura_StoreOp : Op<NeuraDialect, "store"> {
+  let description = [{
+    Stores a flowing value at a dynamic address, or at the next address in a
+    configured memory_access queue. The configured form consumes only value;
+    kernel_input selects the destination memref and offsets lists its ordered
+    element offsets. It uses one memory Tile, without an address-compute Tile.
+  }];
   let arguments = (ins AnyType:$value, Optional<AnyType>:$addr);
   let results = (outs);
   // let assemblyFormat = "$value `,` $addr `,` attr-dict";

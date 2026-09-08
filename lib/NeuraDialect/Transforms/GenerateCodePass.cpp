@@ -25,6 +25,9 @@
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/NeuraAttributes.h"
 #include "NeuraDialect/NeuraOps.h"
+#include "NeuraDialect/NeuraTypes.h"
+#include "mlir/IR/AffineMap.h"
+#include <set>
 
 using namespace mlir;
 using namespace neura;
@@ -34,6 +37,9 @@ namespace {
 struct Operand {
   std::string operand;
   std::string color;
+  // Optional runtime binding; offsets count elements, not bytes.
+  std::string access;
+  std::vector<int64_t> offsets;
   Operand(const std::string &op, const std::string &c = "RED")
       : operand(op), color(c) {}
 };
@@ -2054,10 +2060,21 @@ struct GenerateCodePass
         // sources.
         if (!inst->src_operands.empty()) {
           yaml_out << "                  src_operands:\n";
-          for (const Operand &opnd : inst->src_operands)
+          for (const Operand &opnd : inst->src_operands) {
             yaml_out << "                    - operand: \"" << opnd.operand
                      << "\"\n                      color: \"" << opnd.color
                      << "\"\n";
+            if (!opnd.access.empty()) {
+              yaml_out << "                      access: \"" << opnd.access
+                       << "\"\n                      offsets: [";
+              for (size_t i = 0; i < opnd.offsets.size(); ++i) {
+                if (i)
+                  yaml_out << ", ";
+                yaml_out << opnd.offsets[i];
+              }
+              yaml_out << "]\n";
+            }
+          }
         }
         // destinations.
         if (!inst->dst_operands.empty()) {
@@ -2115,6 +2132,15 @@ struct GenerateCodePass
   }
 
   static std::string formatOperand(const Operand &operand) {
+    if (!operand.access.empty()) {
+      std::string result = "[" + operand.access + "(" + operand.operand + ", ";
+      for (size_t i = 0; i < operand.offsets.size(); ++i) {
+        if (i)
+          result += ", ";
+        result += std::to_string(operand.offsets[i]);
+      }
+      return result + ")]";
+    }
     std::string result = "[" + operand.operand;
     if (isDirectionalOperand(operand.operand)) {
       result += ", " + operand.color;
@@ -2246,9 +2272,277 @@ struct GenerateCodePass
     inst->dst_operands.emplace_back(text, "RED");
   }
 
+  // Checks the supported static memref layout before interpreting element
+  // offsets.
+  FailureOr<MemRefType> getConfiguredMemref(KernelOp kernel, int64_t index) {
+    if (index < 0 || index >= static_cast<int64_t>(kernel.getInputs().size()))
+      return failure();
+    Type type = kernel.getInputs()[index].getType();
+    if (auto predicated = dyn_cast<PredicatedValue>(type))
+      type = predicated.getValueType();
+    auto memref = dyn_cast<MemRefType>(type);
+    if (!memref || !memref.hasStaticShape() ||
+        !memref.getLayout().isIdentity() ||
+        !memref.getElementType().isInteger(32) || memref.getNumElements() <= 0)
+      return failure();
+    return memref;
+  }
+
+  // Keeps runtime memory references symbolic until the existing loader binds
+  // them.
+  Operand getConfiguredOperand(int64_t index, ArrayRef<int64_t> offsets,
+                               bool address) {
+    Operand operand("arg" + std::to_string(index));
+    operand.access = address ? "address" : "value";
+    operand.offsets.assign(offsets.begin(), offsets.end());
+    return operand;
+  }
+
+  // Gets the incoming direction of a verified single-hop mapped data movement.
+  FailureOr<std::string> getTemplateInput(DataMovOp move, Operation *consumer) {
+    auto source = dyn_cast<OpResult>(move.getInput());
+    if (!source)
+      return failure();
+    auto from = mapping_utils::getTileLocation(source.getOwner());
+    auto to = mapping_utils::getTileLocation(consumer);
+    auto route = move->getAttrOfType<ArrayAttr>("mapping_locs");
+    if (!from.has_tile || !to.has_tile || !route || route.size() != 1)
+      return failure();
+    auto location = dyn_cast<DictionaryAttr>(route[0]);
+    auto resource =
+        location ? location.getAs<StringAttr>("resource") : StringAttr{};
+    auto id = location ? location.getAs<IntegerAttr>("id") : IntegerAttr{};
+    if (!resource || resource != "link" || !id)
+      return failure();
+    bool matches = false;
+    for (Link *link : getArchitecture().getAllLinks())
+      if (link->getId() == id.getInt() &&
+          link->getSrcTile()->getX() == from.col_idx &&
+          link->getSrcTile()->getY() == from.row_idx &&
+          link->getDstTile()->getX() == to.col_idx &&
+          link->getDstTile()->getY() == to.row_idx)
+        matches = true;
+    if (!matches)
+      return failure();
+    int dx = from.col_idx - to.col_idx, dy = from.row_idx - to.row_idx;
+    if (dx == -1 && dy == 0)
+      return std::string("WEST");
+    if (dx == 1 && dy == 0)
+      return std::string("EAST");
+    if (dx == 0 && dy == 1)
+      return std::string("NORTH");
+    if (dx == 0 && dy == -1)
+      return std::string("SOUTH");
+    return failure();
+  }
+
+  // Emits configured LD/MAC/ST using the same instructions and YAML/ASM
+  // writers.
+  LogicalResult generateConfiguredKernel(KernelOp kernel) {
+    auto info = kernel->getAttrOfType<DictionaryAttr>("mapping_info");
+    auto ii = info ? info.getAs<IntegerAttr>("compiled_ii") : IntegerAttr{};
+    auto width = info ? info.getAs<IntegerAttr>("x_tiles") : IntegerAttr{};
+    auto height = info ? info.getAs<IntegerAttr>("y_tiles") : IntegerAttr{};
+    auto mode = info ? info.getAs<StringAttr>("mapping_mode") : StringAttr{};
+    if (kernel.getNumResults() != 0 || !kernel.getBody().hasOneBlock() || !ii ||
+        ii.getInt() != 1 || !width || !height || width.getInt() <= 0 ||
+        height.getInt() <= 0 || !mode || mode != "spatial-only")
+      return kernel.emitOpError(
+          "configured codegen requires spatial-only II=1 mapping");
+
+    auto metadata = kernel->getAttrOfType<DictionaryAttr>("kernel_metadata");
+    auto description = metadata ? metadata.getAs<DictionaryAttr>("template")
+                                : DictionaryAttr{};
+    auto stationary = description
+                          ? description.getAs<DictionaryAttr>("stationary")
+                          : DictionaryAttr{};
+    auto input = stationary ? stationary.getAs<IntegerAttr>("kernel_input")
+                            : IntegerAttr{};
+    auto map =
+        stationary ? stationary.getAs<AffineMapAttr>("map") : AffineMapAttr{};
+    if (!input || !map || map.getValue().getNumDims() != 2 ||
+        map.getValue().getNumSymbols() != 0)
+      return kernel.emitOpError(
+          "requires stationary kernel_input and a symbol-free Tile map");
+    auto weights = getConfiguredMemref(kernel, input.getInt());
+    if (failed(weights))
+      return kernel.emitOpError(
+          "stationary input requires a static identity-layout i32 memref");
+
+    clearState();
+    std::map<Operation *, Instruction> instructions;
+    std::map<Operation *, Instruction> forwarders;
+    std::set<std::pair<int, int>> occupied;
+    int64_t queue_length = -1;
+    int next_id = 0;
+    for (Operation &op : kernel.getBody().front()) {
+      if (isa<DataMovOp, YieldOp>(op))
+        continue;
+      if (!isa<LoadOp, StoreOp, MacOp>(op))
+        return op.emitOpError(
+            "unsupported operation in configured kernel codegen");
+      for (Type type :
+           llvm::concat<Type>(op.getOperandTypes(), op.getResultTypes())) {
+        if (auto predicated = dyn_cast<PredicatedValue>(type))
+          type = predicated.getValueType();
+        if (!type.isInteger(32))
+          return op.emitOpError(
+              "configured codegen currently supports only i32 data");
+      }
+      auto tile = mapping_utils::getTileLocation(&op);
+      if (!tile.has_tile || tile.col_idx < 0 ||
+          tile.col_idx >= width.getInt() || tile.row_idx < 0 ||
+          tile.row_idx >= height.getInt() ||
+          !occupied.emplace(tile.col_idx, tile.row_idx).second)
+        return op.emitOpError(
+            "requires one distinct mapped Tile per operation");
+
+      Instruction inst(isa<LoadOp>(op)               ? "LOAD"
+                       : isa<StoreOp>(op)            ? "STORE"
+                       : cast<MacOp>(op).getInput1() ? "MUL_ADD"
+                                                     : "MUL");
+      inst.id = next_id++;
+      // A spatial-only data-driven network needs no disabled prologue firings.
+      // The mapped times describe the wavefront; val/rdy enforces dependencies.
+      inst.time_step = inst.index_per_ii = inst.invalid_iterations = 0;
+      for (Value operand : op.getOperands()) {
+        auto move = operand.getDefiningOp<DataMovOp>();
+        FailureOr<std::string> direction = failure();
+        if (move)
+          direction = getTemplateInput(move, &op);
+        if (failed(direction))
+          return op.emitOpError(
+              "configured codegen requires single-hop mapped inputs");
+        inst.src_operands.emplace_back(*direction);
+      }
+
+      if (isa<LoadOp, StoreOp>(op)) {
+        if ((isa<LoadOp>(op) && op.getNumOperands() != 0) ||
+            (isa<StoreOp>(op) && op.getNumOperands() != 1))
+          return op.emitOpError(
+              "configured LD/ST cannot have a dynamic address");
+        auto memory = op.getAttrOfType<DictionaryAttr>("memory_access");
+        auto index =
+            memory ? memory.getAs<IntegerAttr>("kernel_input") : IntegerAttr{};
+        auto offsets = memory ? memory.getAs<DenseI64ArrayAttr>("offsets")
+                              : DenseI64ArrayAttr{};
+        FailureOr<MemRefType> memref = failure();
+        if (index)
+          memref = getConfiguredMemref(kernel, index.getInt());
+        if (failed(memref) || !offsets || offsets.size() == 0)
+          return op.emitOpError(
+              "memory_access requires a static identity-layout i32 memref and "
+              "nonempty offsets");
+        if (tile.col_idx != 0 && tile.row_idx != 0)
+          return op.emitOpError(
+              "VectorCGRA memory Tiles must lie on the west or south edge");
+        for (int64_t offset : offsets.asArrayRef())
+          if (offset < 0 || offset >= memref->getNumElements())
+            return op.emitOpError(
+                "memory_access element offset is out of bounds");
+        if (queue_length < 0)
+          queue_length = offsets.size();
+        if (queue_length != static_cast<int64_t>(offsets.size()) ||
+            queue_length > getArchitecture().getMaxCtrlMemItems())
+          return op.emitOpError(
+              "address queues require equal lengths within target capacity");
+        inst.src_operands.push_back(
+            getConfiguredOperand(index.getInt(), offsets.asArrayRef(), true));
+      } else {
+        SmallVector<Attribute> indices;
+        Type index_type = IndexType::get(kernel.getContext());
+        if (failed(map.getValue().constantFold(
+                {IntegerAttr::get(index_type, tile.col_idx),
+                 IntegerAttr::get(index_type, tile.row_idx)},
+                indices)) ||
+            indices.size() != static_cast<size_t>(weights->getRank()))
+          return op.emitOpError(
+              "stationary map must resolve one memref element per Tile");
+        int64_t offset = 0;
+        for (auto [attribute, size] : llvm::zip(indices, weights->getShape())) {
+          auto index = dyn_cast<IntegerAttr>(attribute);
+          if (!index || index.getInt() < 0 || index.getInt() >= size)
+            return op.emitOpError("stationary element is out of bounds");
+          offset = offset * size + index.getInt();
+        }
+        // Preserve arithmetic positions: flowing * stationary + partial_sum.
+        inst.src_operands.insert(
+            inst.src_operands.begin() + 1,
+            getConfiguredOperand(input.getInt(), {offset}, false));
+      }
+      instructions.emplace(&op, std::move(inst));
+    }
+
+    // Keep result 0 on the FU crossbar and result 1 on the routing crossbar.
+    for (Operation &operation : kernel.getBody().front()) {
+      Operation *consumer = &operation;
+      if (!instructions.count(consumer))
+        continue;
+      for (Value operand : consumer->getOperands()) {
+        auto move = operand.getDefiningOp<DataMovOp>();
+        auto source = cast<OpResult>(move.getInput());
+        if (!instructions.count(source.getOwner()))
+          return move.emitOpError("producer is not a configured instruction");
+        auto incoming = getTemplateInput(move, consumer);
+        if (failed(incoming))
+          return failure();
+        std::string outgoing = *incoming == "WEST"    ? "EAST"
+                               : *incoming == "EAST"  ? "WEST"
+                               : *incoming == "NORTH" ? "SOUTH"
+                                                      : "NORTH";
+        Instruction *producer = &instructions.at(source.getOwner());
+        if (isa<MacOp>(source.getOwner()) && source.getResultNumber() == 1) {
+          auto [it, inserted] =
+              forwarders.try_emplace(source.getOwner(), "DATA_MOV");
+          if (inserted) {
+            it->second.id = next_id++;
+            it->second.time_step = it->second.index_per_ii = 0;
+            it->second.src_operands.push_back(producer->src_operands.front());
+          }
+          producer = &it->second;
+        }
+        setUniqueDestination(producer, outgoing);
+      }
+    }
+    // Emit in block order for deterministic instruction IDs and output.
+    for (Operation &op : kernel.getBody().front()) {
+      auto it = instructions.find(&op);
+      if (it == instructions.end())
+        continue;
+      auto tile = mapping_utils::getTileLocation(&op);
+      auto &group = tile_time_instructions[{tile.col_idx, tile.row_idx}][0];
+      group.push_back(std::move(it->second));
+      if (auto forward = forwarders.find(&op); forward != forwarders.end())
+        group.push_back(std::move(forward->second));
+    }
+    ArrayConfig config = buildArrayConfig(width.getInt(), height.getInt(), 1);
+    writeYAMLOutput(config);
+    writeAsmOutput(config);
+    return success();
+  }
+
   // ---------- entry point ----------.
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    SmallVector<KernelOp> configured;
+    module.walk([&](KernelOp kernel) {
+      bool has_configuration = false;
+      kernel.walk([&](Operation *op) {
+        has_configuration |= isa<MacOp>(op) || op->hasAttr("memory_access");
+      });
+      if (has_configuration)
+        configured.push_back(kernel);
+    });
+    if (!configured.empty()) {
+      if (configured.size() != 1) {
+        module.emitError(
+            "code generation supports one configured kernel per output file");
+        return signalPassFailure();
+      }
+      if (failed(generateConfiguredKernel(configured.front())))
+        signalPassFailure();
+      return;
+    }
 
     for (auto func : module.getOps<func::FuncOp>()) {
       auto accel = func->getAttrOfType<StringAttr>(accel::kAcceleratorAttr);

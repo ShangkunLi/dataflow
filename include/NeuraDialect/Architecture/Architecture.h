@@ -21,26 +21,11 @@ namespace neura {
 enum class ResourceKind {
   Tile,
   Link,
-  BoundaryPort,
   FunctionUnit,
   Register,
   RegisterFile,
   RegisterFileCluster,
 };
-
-// Physical side of the CGRA array where a boundary port is attached.
-enum class BoundaryPortDirection { North, South, East, West };
-
-// Whether data enters or leaves the array through a boundary port.
-enum class BoundaryPortKind { Input, Output };
-
-// Converts between the textual representation used in kernel metadata and
-// the strongly typed architecture representation.
-std::optional<BoundaryPortDirection>
-parseBoundaryPortDirection(llvm::StringRef direction);
-
-llvm::StringRef stringifyBoundaryPortDirection(BoundaryPortDirection direction);
-llvm::StringRef stringifyBoundaryPortKind(BoundaryPortKind kind);
 
 // Enumeration for function unit resource type.
 enum class FunctionUnitKind {
@@ -179,7 +164,6 @@ public:
 // Forward declaration for use in Tile.
 class Tile;
 class Link;
-class BoundaryPort;
 class FunctionUnit;
 class Register;
 class RegisterFile;
@@ -294,15 +278,6 @@ public:
 
   const std::vector<Register *> getRegisters() const;
 
-  // Boundary ports management.
-  void addBoundaryPort(BoundaryPort *port) {
-    assert(port && "Cannot add a null port");
-    boundary_ports.insert(port);
-  }
-  const std::set<BoundaryPort *> &getBoundaryPorts() const {
-    return boundary_ports;
-  }
-
   // Memory management.
   int getMemoryCapacity() const { return memory_capacity; }
   void setMemoryCapacity(int capacity) { memory_capacity = capacity; }
@@ -319,8 +294,7 @@ private:
   std::set<FunctionUnit *> functional_units; // Non-owning, for fast lookup.
   RegisterFileCluster *register_file_cluster = nullptr;
 
-  // Boundary port and memory configuration.
-  std::set<BoundaryPort *> boundary_ports;
+  // Memory configuration.
   int memory_capacity = -1; // -1 means not configured.
 };
 
@@ -358,36 +332,6 @@ private:
   Tile *dst_tile;
   int latency = 1;    // Latency in cycles.
   int bandwidth = 32; // Bandwidth in bits per cycle.
-};
-
-//===----------------------------------------------------------------------===//
-// Boundary Port.
-//===----------------------------------------------------------------------===//
-class BoundaryPort : public BasicResource {
-public:
-  BoundaryPort(int id, BoundaryPortKind port_kind,
-               BoundaryPortDirection direction, Tile *tile);
-
-  int getId() const override { return id; }
-  std::string getType() const override { return "boundary_port"; }
-
-  ResourceKind getKind() const override { return ResourceKind::BoundaryPort; }
-
-  static bool classof(const BasicResource *resource) {
-    return resource && resource->getKind() == ResourceKind::BoundaryPort;
-  }
-
-  BoundaryPortKind getBoundaryPortKind() const { return port_kind; }
-  BoundaryPortDirection getBoundaryPortDirection() const { return direction; }
-
-  // Returns the boundary tile physically attached to this port.
-  Tile *getTile() const { return tile; }
-
-private:
-  int id;
-  BoundaryPortKind port_kind;
-  BoundaryPortDirection direction;
-  Tile *tile;
 };
 
 //===----------------------------------------------------------------------===//
@@ -536,12 +480,6 @@ public:
   void removeLink(int src_tile_x, int src_tile_y, int dst_tile_x,
                   int dst_tile_y);
 
-  BoundaryPort *getBoundaryPort(BoundaryPortKind port_kind,
-                                BoundaryPortDirection direction, int x,
-                                int y) const;
-
-  std::vector<BoundaryPort *> getAllBoundaryPorts() const;
-
   // Tile management.
   void removeTile(int tile_id);
 
@@ -591,18 +529,12 @@ private:
   void createKingMeshLinks(int &link_id, const LinkDefaults &link_defaults);
   void createRingLinks(int &link_id, const LinkDefaults &link_defaults);
 
-  // Boundary ports are initialized after tile overrides so that no port is
-  // attached to a tile removed from the target architecture.
-  void initializeBoundaryPorts();
-
-  // Architecture components: tiles, links, ports, and their mappings.
+  // Architecture components: tiles, links, and their mappings.
   // Memory is now modeled as part of Tile class.
   std::map<int, std::unique_ptr<Tile>>
       tile_storage_; // Owns tiles, key is unique tile_id.
   std::map<int, std::unique_ptr<Link>>
       link_storage_; // Owns links, key is unique link_id.
-  std::map<int, std::unique_ptr<BoundaryPort>>
-      boundary_port_storage_; // Owns boundary ports, key is unique port_id.
   std::unordered_map<int, Tile *>
       id_to_tile_; // Maps unique tile_id to Tile pointer.
   std::unordered_map<std::pair<int, int>, Tile *, PairHash>
