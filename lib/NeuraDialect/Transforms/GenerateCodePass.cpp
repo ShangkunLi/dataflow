@@ -197,11 +197,17 @@ static std::optional<int> getMappedRegId(Operation *op) {
 } // namespace mapping_utils
 
 static std::string getOpcode(Operation *op) {
+  if (auto mac = dyn_cast<MacOp>(op)) {
+    return mac.getInput1() ? "MUL_ADD" : "MUL";
+  }
+
   std::string opcode = op->getName().getStringRef().str();
-  if (opcode.rfind("neura.", 0) == 0)
+  if (opcode.rfind("neura.", 0) == 0) {
     opcode = opcode.substr(6);
-  if (isConstant(op))
+  }
+  if (isConstant(op)) {
     return "CONSTANT";
+  }
   std::transform(opcode.begin(), opcode.end(), opcode.begin(), ::toupper);
 
   // For comparison operations, appends the comparison type to the opcode.
@@ -470,6 +476,7 @@ struct GenerateCodePass
   // Back references from IR operations to emitted instructions.
   DenseMap<Operation *, InstructionReference>
       operation_to_instruction_reference;
+  DenseMap<Operation *, InstructionReference> forwarding_instruction_reference;
   DenseMap<Operation *, SmallVector<Value>> operation_to_operands;
   // Map dfg_id -> op for later adjustments.
   DenseMap<int, Operation *> dfg_id_to_op;
@@ -478,6 +485,10 @@ struct GenerateCodePass
   int next_instruction_id = 0;
   int current_compiled_ii = -1;
   bool timing_field_error = false;
+  KernelOp current_kernel;
+  int stationary_input_index = -1;
+  AffineMapAttr stationary_map;
+  bool static_dataflow = false;
 
   // De-dup sets.
   std::unordered_set<uint64_t>
@@ -508,6 +519,7 @@ struct GenerateCodePass
     operation_placements.clear();
     tile_time_instructions.clear();
     operation_to_instruction_reference.clear();
+    forwarding_instruction_reference.clear();
     operation_to_operands.clear();
     dfg_id_to_op.clear();
     hop_signatures.clear();
@@ -516,14 +528,18 @@ struct GenerateCodePass
     instruction_id_map.clear();
     next_instruction_id = 0;
     timing_field_error = false;
+    current_kernel = nullptr;
+    stationary_input_index = -1;
+    stationary_map = nullptr;
+    static_dataflow = false;
   }
 
-  std::pair<int, int> getArrayDimensions(func::FuncOp function) {
+  std::pair<int, int> getArrayDimensions(Operation *scope) {
     const Architecture &architecture = mlir::neura::getArchitecture();
     int columns = architecture.getPerCgraColumns();
     int rows = architecture.getPerCgraRows();
     if (auto mapping_info =
-            function->getAttrOfType<DictionaryAttr>(attr::kMappingInfo)) {
+            scope->getAttrOfType<DictionaryAttr>(attr::kMappingInfo)) {
       if (auto x_tiles =
               dyn_cast_or_null<IntegerAttr>(mapping_info.get(attr::kXTiles)))
         columns = x_tiles.getInt();
@@ -534,9 +550,9 @@ struct GenerateCodePass
     return {columns, rows};
   }
 
-  int getCompiledII(func::FuncOp function) {
+  int getCompiledII(Operation *scope) {
     if (auto mapping_info =
-            function->getAttrOfType<DictionaryAttr>(attr::kMappingInfo)) {
+            scope->getAttrOfType<DictionaryAttr>(attr::kMappingInfo)) {
       if (auto compiled_ii = dyn_cast_or_null<IntegerAttr>(
               mapping_info.get(attr::kCompiledII))) {
         return compiled_ii.getInt();
@@ -553,6 +569,9 @@ struct GenerateCodePass
   }
 
   int syntheticInvalidIterations(int time_step) const {
+    if (static_dataflow) {
+      return 0;
+    }
     return current_compiled_ii > 0 ? time_step / current_compiled_ii : 0;
   }
 
@@ -602,10 +621,10 @@ struct GenerateCodePass
   //   - materialize compute/phi/const instructions.
   //   - collect DATA_MOV and CTRL_MOV ops.
   //   - collect reserve_to_phi_maps (PHI's operand#0 is the reserve).
-  void indexIR(func::FuncOp function, SmallVector<Operation *> &data_movs,
+  void indexIR(Operation *scope, SmallVector<Operation *> &data_movs,
                SmallVector<Operation *> &ctrl_movs,
                DenseMap<Value, Operation *> &reserve_to_phi_map) {
-    function.walk([&](Operation *op) {
+    scope->walk([&](Operation *op) {
       // Skips operations inside fused_op regions.
       if (op->getParentOp() && isFusedOp(op->getParentOp())) {
         return;
@@ -681,32 +700,37 @@ struct GenerateCodePass
           inst.src_operands.emplace_back("UNRESOLVED", "RED");
         };
 
-        // StoreIndexed has operand order: value(lhs) -> base(rhs) -> indices.
-        // rhs_value must be inserted before indices (not appended at tail).
-        if (auto store_indexed_op = dyn_cast<StoreIndexedOp>(op)) {
-          bool lhs_folded = appendLiteralSlot(op->getAttr(attr::kLhsValue));
-          if (!lhs_folded)
-            appendValueSlot(store_indexed_op.getValue());
+        // Configured operands extend the normal per-operation encoder.
+        // Other operation kinds continue through the generic path below.
+        if (!encodeConfiguredOperands(op, inst, operands)) {
+          if (auto store_indexed_op = dyn_cast<StoreIndexedOp>(op)) {
+            bool lhs_folded = appendLiteralSlot(op->getAttr(attr::kLhsValue));
+            if (!lhs_folded) {
+              appendValueSlot(store_indexed_op.getValue());
+            }
 
-          bool rhs_folded = appendLiteralSlot(op->getAttr(attr::kRhsValue));
-          if (!rhs_folded) {
-            Value base = store_indexed_op.getBase();
-            if (base)
-              appendValueSlot(base);
-          }
+            bool rhs_folded = appendLiteralSlot(op->getAttr(attr::kRhsValue));
+            if (!rhs_folded) {
+              Value base = store_indexed_op.getBase();
+              if (base) {
+                appendValueSlot(base);
+              }
+            }
 
-          for (Value index : store_indexed_op.getIndices()) {
-            appendValueSlot(index);
+            for (Value index : store_indexed_op.getIndices()) {
+              appendValueSlot(index);
+            }
+          } else {
+            // Generic handling:
+            // - lhs_value is the leading source slot.
+            // - remaining Value operands keep original order.
+            // - rhs_value is the trailing source slot.
+            appendLiteralSlot(op->getAttr(attr::kLhsValue));
+            for (Value value : op->getOperands()) {
+              appendValueSlot(value);
+            }
+            appendLiteralSlot(op->getAttr(attr::kRhsValue));
           }
-        } else {
-          // Generic handling:
-          // - lhs_value is the leading source slot.
-          // - remaining Value operands keep original order.
-          // - rhs_value is the trailing source slot.
-          appendLiteralSlot(op->getAttr(attr::kLhsValue));
-          for (Value v : op->getOperands())
-            appendValueSlot(v);
-          appendLiteralSlot(op->getAttr(attr::kRhsValue));
         }
 
         operation_to_operands[op] = std::move(operands);
@@ -721,7 +745,7 @@ struct GenerateCodePass
         return;
 
       inst.index_per_ii = index_per_ii;
-      inst.invalid_iterations = invalid_iterations;
+      inst.invalid_iterations = static_dataflow ? 0 : invalid_iterations;
 
       auto &bucket = getInstructionBucket(placement.col_idx, placement.row_idx,
                                           index_per_ii);
@@ -773,24 +797,35 @@ struct GenerateCodePass
   //   instructions.
   // - Else: producer writes to producer_direction if link-based, or $reg for
   // reg-only paths.
-  void setProducerDestination(Operation *producer, StringRef producer_direction,
+  void setProducerDestination(Value source, StringRef producer_direction,
                               const SmallVector<RegStep, 4> &regs,
                               ArrayRef<RegStep> src_reg_steps) {
-    if (auto *pi = getInstructionPointer(producer)) {
+    Operation *producer = source.getDefiningOp();
+    Instruction *instruction = nullptr;
+    if (auto result = dyn_cast<OpResult>(source);
+        result && isa<MacOp>(producer) && result.getResultNumber() == 1) {
+      instruction = getForwardingInstruction(result);
+    } else {
+      instruction = getInstructionPointer(producer);
+    }
+
+    if (instruction) {
       if (!src_reg_steps.empty()) {
         // This mov uses source-side register transfers + egress to send on
         // link.time_step. We still must NOT delete existing directional
         // outputs, because the same producer may fan-out to other consumers via
         // other mov paths.
-        setUniqueDestination(pi,
+        setUniqueDestination(instruction,
                              "$" + std::to_string(src_reg_steps.front().regId));
         return;
       }
 
-      if (!producer_direction.empty() && producer_direction != "LOCAL")
-        setUniqueDestination(pi, producer_direction.str());
-      else if (!regs.empty())
-        setUniqueDestination(pi, "$" + std::to_string(regs.back().regId));
+      if (!producer_direction.empty() && producer_direction != "LOCAL") {
+        setUniqueDestination(instruction, producer_direction.str());
+      } else if (!regs.empty()) {
+        setUniqueDestination(instruction,
+                             "$" + std::to_string(regs.back().regId));
+      }
     }
   }
 
@@ -1158,6 +1193,7 @@ struct GenerateCodePass
 
   template <bool IsCtrl> struct MovBasics {
     int mov_dfg_id = -1;
+    Value source;
     Operation *producer = nullptr;
     SmallVector<LinkStep, 8> links;
     SmallVector<RegStep, 4> regs;
@@ -1173,6 +1209,7 @@ struct GenerateCodePass
 
     // Basic info from forwarders.
     Value source = forwarder->getOperand(0);
+    basics.source = source;
     basics.producer = source.getDefiningOp();
     basics.links = getLinkChain(forwarder);
     basics.regs = getRegisterSteps(forwarder);
@@ -1190,7 +1227,7 @@ struct GenerateCodePass
                                   const Topology &topo) {
     (void)forwarder;
     // Producer endpoints & intermediate hops.
-    setProducerDestination(basics.producer, basics.producer_direction,
+    setProducerDestination(basics.source, basics.producer_direction,
                            basics.regs, basics.reg_split.src_reg_steps);
     size_t next_synthetic_offset = emitSourceSyntheticChain<IsCtrl>(
         basics.reg_split, basics.links, topo, basics.mov_dfg_id);
@@ -2239,6 +2276,43 @@ struct GenerateCodePass
     return &vec[idx];
   }
 
+  Instruction *getForwardingInstruction(OpResult source) {
+    Operation *producer = source.getOwner();
+    auto existing = forwarding_instruction_reference.find(producer);
+    if (existing != forwarding_instruction_reference.end()) {
+      auto [column, row, index, position] = existing->second;
+      auto &instructions = tile_time_instructions[{column, row}][index];
+      return &instructions[position];
+    }
+
+    Instruction *compute = getInstructionPointer(producer);
+    if (!compute || compute->src_operands.empty()) {
+      producer->emitError("cannot forward a MAC input before it is routed");
+      timing_field_error = true;
+      return nullptr;
+    }
+
+    auto reference = operation_to_instruction_reference.find(producer);
+    if (reference == operation_to_instruction_reference.end()) {
+      return nullptr;
+    }
+
+    auto [column, row, index, position] = reference->second;
+    (void)position;
+    Instruction forwarding("DATA_MOV");
+    forwarding.time_step = compute->time_step;
+    forwarding.index_per_ii = compute->index_per_ii;
+    forwarding.invalid_iterations = compute->invalid_iterations;
+    forwarding.src_operands.push_back(compute->src_operands.front());
+
+    auto &instructions = tile_time_instructions[{column, row}][index];
+    instructions.push_back(std::move(forwarding));
+    int forwarding_position = static_cast<int>(instructions.size()) - 1;
+    forwarding_instruction_reference[producer] =
+        InstructionReference{column, row, index, forwarding_position};
+    return &instructions[forwarding_position];
+  }
+
   // Replaces the exact source slots in consumers that correspond to
   // `value_at_consumer`, or fills the first UNRESOLVED placeholder if a 1:1
   // match wasn't found.
@@ -2298,274 +2372,185 @@ struct GenerateCodePass
     return operand;
   }
 
-  // Gets the incoming direction of a verified single-hop mapped data movement.
-  FailureOr<std::string> getTemplateInput(DataMovOp move, Operation *consumer) {
-    auto source = dyn_cast<OpResult>(move.getInput());
-    if (!source)
-      return failure();
-    auto from = mapping_utils::getTileLocation(source.getOwner());
-    auto to = mapping_utils::getTileLocation(consumer);
-    auto route = move->getAttrOfType<ArrayAttr>("mapping_locs");
-    if (!from.has_tile || !to.has_tile || !route || route.size() != 1)
-      return failure();
-    auto location = dyn_cast<DictionaryAttr>(route[0]);
-    auto resource =
-        location ? location.getAs<StringAttr>("resource") : StringAttr{};
-    auto id = location ? location.getAs<IntegerAttr>("id") : IntegerAttr{};
-    if (!resource || resource != "link" || !id)
-      return failure();
-    bool matches = false;
-    for (Link *link : getArchitecture().getAllLinks())
-      if (link->getId() == id.getInt() &&
-          link->getSrcTile()->getX() == from.col_idx &&
-          link->getSrcTile()->getY() == from.row_idx &&
-          link->getDstTile()->getX() == to.col_idx &&
-          link->getDstTile()->getY() == to.row_idx)
-        matches = true;
-    if (!matches)
-      return failure();
-    int dx = from.col_idx - to.col_idx, dy = from.row_idx - to.row_idx;
-    if (dx == -1 && dy == 0)
-      return std::string("WEST");
-    if (dx == 1 && dy == 0)
-      return std::string("EAST");
-    if (dx == 0 && dy == 1)
-      return std::string("NORTH");
-    if (dx == 0 && dy == -1)
-      return std::string("SOUTH");
-    return failure();
-  }
+  // Loads template-level bindings used by configured operands.
+  LogicalResult configureKernel(KernelOp kernel) {
+    current_kernel = kernel;
 
-  // Emits configured LD/MAC/ST using the same instructions and YAML/ASM
-  // writers.
-  LogicalResult generateConfiguredKernel(KernelOp kernel) {
-    auto info = kernel->getAttrOfType<DictionaryAttr>("mapping_info");
-    auto ii = info ? info.getAs<IntegerAttr>("compiled_ii") : IntegerAttr{};
-    auto width = info ? info.getAs<IntegerAttr>("x_tiles") : IntegerAttr{};
-    auto height = info ? info.getAs<IntegerAttr>("y_tiles") : IntegerAttr{};
-    auto mode = info ? info.getAs<StringAttr>("mapping_mode") : StringAttr{};
-    if (kernel.getNumResults() != 0 || !kernel.getBody().hasOneBlock() || !ii ||
-        ii.getInt() != 1 || !width || !height || width.getInt() <= 0 ||
-        height.getInt() <= 0 || !mode || mode != "spatial-only")
-      return kernel.emitOpError(
-          "configured codegen requires spatial-only II=1 mapping");
+    bool has_mac = false;
+    kernel.walk([&](MacOp) { has_mac = true; });
+    if (!has_mac) {
+      return success();
+    }
+
+    auto mapping_info =
+        kernel->getAttrOfType<DictionaryAttr>(attr::kMappingInfo);
+    auto mapping_mode = mapping_info
+                            ? mapping_info.getAs<StringAttr>(attr::kMappingMode)
+                            : StringAttr{};
+    static_dataflow = current_compiled_ii == 1 && mapping_mode &&
+                      mapping_mode.getValue() == "spatial-only";
 
     auto metadata = kernel->getAttrOfType<DictionaryAttr>("kernel_metadata");
-    auto description = metadata ? metadata.getAs<DictionaryAttr>("template")
-                                : DictionaryAttr{};
-    auto stationary = description
-                          ? description.getAs<DictionaryAttr>("stationary")
-                          : DictionaryAttr{};
+    auto template_metadata = metadata
+                                 ? metadata.getAs<DictionaryAttr>("template")
+                                 : DictionaryAttr{};
+    auto stationary =
+        template_metadata
+            ? template_metadata.getAs<DictionaryAttr>("stationary")
+            : DictionaryAttr{};
     auto input = stationary ? stationary.getAs<IntegerAttr>("kernel_input")
                             : IntegerAttr{};
-    auto map =
+    stationary_map =
         stationary ? stationary.getAs<AffineMapAttr>("map") : AffineMapAttr{};
-    if (!input || !map || map.getValue().getNumDims() != 2 ||
-        map.getValue().getNumSymbols() != 0)
+
+    if (!input || !stationary_map) {
       return kernel.emitOpError(
-          "requires stationary kernel_input and a symbol-free Tile map");
-    auto weights = getConfiguredMemref(kernel, input.getInt());
-    if (failed(weights))
+          "configured MAC requires stationary kernel_input and map");
+    }
+
+    stationary_input_index = input.getInt();
+    if (failed(getConfiguredMemref(kernel, stationary_input_index))) {
       return kernel.emitOpError(
-          "stationary input requires a static identity-layout i32 memref");
-
-    clearState();
-    std::map<Operation *, Instruction> instructions;
-    std::map<Operation *, Instruction> forwarders;
-    std::set<std::pair<int, int>> occupied;
-    int64_t queue_length = -1;
-    int next_id = 0;
-    for (Operation &op : kernel.getBody().front()) {
-      if (isa<DataMovOp, YieldOp>(op))
-        continue;
-      if (!isa<LoadOp, StoreOp, MacOp>(op))
-        return op.emitOpError(
-            "unsupported operation in configured kernel codegen");
-      for (Type type :
-           llvm::concat<Type>(op.getOperandTypes(), op.getResultTypes())) {
-        if (auto predicated = dyn_cast<PredicatedValue>(type))
-          type = predicated.getValueType();
-        if (!type.isInteger(32))
-          return op.emitOpError(
-              "configured codegen currently supports only i32 data");
-      }
-      auto tile = mapping_utils::getTileLocation(&op);
-      if (!tile.has_tile || tile.col_idx < 0 ||
-          tile.col_idx >= width.getInt() || tile.row_idx < 0 ||
-          tile.row_idx >= height.getInt() ||
-          !occupied.emplace(tile.col_idx, tile.row_idx).second)
-        return op.emitOpError(
-            "requires one distinct mapped Tile per operation");
-
-      Instruction inst(isa<LoadOp>(op)               ? "LOAD"
-                       : isa<StoreOp>(op)            ? "STORE"
-                       : cast<MacOp>(op).getInput1() ? "MUL_ADD"
-                                                     : "MUL");
-      inst.id = next_id++;
-      // A spatial-only data-driven network needs no disabled prologue firings.
-      // The mapped times describe the wavefront; val/rdy enforces dependencies.
-      inst.time_step = inst.index_per_ii = inst.invalid_iterations = 0;
-      for (Value operand : op.getOperands()) {
-        auto move = operand.getDefiningOp<DataMovOp>();
-        FailureOr<std::string> direction = failure();
-        if (move)
-          direction = getTemplateInput(move, &op);
-        if (failed(direction))
-          return op.emitOpError(
-              "configured codegen requires single-hop mapped inputs");
-        inst.src_operands.emplace_back(*direction);
-      }
-
-      if (isa<LoadOp, StoreOp>(op)) {
-        if ((isa<LoadOp>(op) && op.getNumOperands() != 0) ||
-            (isa<StoreOp>(op) && op.getNumOperands() != 1))
-          return op.emitOpError(
-              "configured LD/ST cannot have a dynamic address");
-        auto memory = op.getAttrOfType<DictionaryAttr>("memory_access");
-        auto index =
-            memory ? memory.getAs<IntegerAttr>("kernel_input") : IntegerAttr{};
-        auto offsets = memory ? memory.getAs<DenseI64ArrayAttr>("offsets")
-                              : DenseI64ArrayAttr{};
-        FailureOr<MemRefType> memref = failure();
-        if (index)
-          memref = getConfiguredMemref(kernel, index.getInt());
-        if (failed(memref) || !offsets || offsets.size() == 0)
-          return op.emitOpError(
-              "memory_access requires a static identity-layout i32 memref and "
-              "nonempty offsets");
-        if (tile.col_idx != 0 && tile.row_idx != 0)
-          return op.emitOpError(
-              "VectorCGRA memory Tiles must lie on the west or south edge");
-        for (int64_t offset : offsets.asArrayRef())
-          if (offset < 0 || offset >= memref->getNumElements())
-            return op.emitOpError(
-                "memory_access element offset is out of bounds");
-        if (queue_length < 0)
-          queue_length = offsets.size();
-        if (queue_length != static_cast<int64_t>(offsets.size()) ||
-            queue_length > getArchitecture().getMaxCtrlMemItems())
-          return op.emitOpError(
-              "address queues require equal lengths within target capacity");
-        inst.src_operands.push_back(
-            getConfiguredOperand(index.getInt(), offsets.asArrayRef(), true));
-      } else {
-        SmallVector<Attribute> indices;
-        Type index_type = IndexType::get(kernel.getContext());
-        if (failed(map.getValue().constantFold(
-                {IntegerAttr::get(index_type, tile.col_idx),
-                 IntegerAttr::get(index_type, tile.row_idx)},
-                indices)) ||
-            indices.size() != static_cast<size_t>(weights->getRank()))
-          return op.emitOpError(
-              "stationary map must resolve one memref element per Tile");
-        int64_t offset = 0;
-        for (auto [attribute, size] : llvm::zip(indices, weights->getShape())) {
-          auto index = dyn_cast<IntegerAttr>(attribute);
-          if (!index || index.getInt() < 0 || index.getInt() >= size)
-            return op.emitOpError("stationary element is out of bounds");
-          offset = offset * size + index.getInt();
-        }
-        // Preserve arithmetic positions: flowing * stationary + partial_sum.
-        inst.src_operands.insert(
-            inst.src_operands.begin() + 1,
-            getConfiguredOperand(input.getInt(), {offset}, false));
-      }
-      instructions.emplace(&op, std::move(inst));
+          "stationary input requires a static identity-layout i32 "
+          "memref");
     }
-
-    // Keep result 0 on the FU crossbar and result 1 on the routing crossbar.
-    for (Operation &operation : kernel.getBody().front()) {
-      Operation *consumer = &operation;
-      if (!instructions.count(consumer))
-        continue;
-      for (Value operand : consumer->getOperands()) {
-        auto move = operand.getDefiningOp<DataMovOp>();
-        auto source = cast<OpResult>(move.getInput());
-        if (!instructions.count(source.getOwner()))
-          return move.emitOpError("producer is not a configured instruction");
-        auto incoming = getTemplateInput(move, consumer);
-        if (failed(incoming))
-          return failure();
-        std::string outgoing = *incoming == "WEST"    ? "EAST"
-                               : *incoming == "EAST"  ? "WEST"
-                               : *incoming == "NORTH" ? "SOUTH"
-                                                      : "NORTH";
-        Instruction *producer = &instructions.at(source.getOwner());
-        if (isa<MacOp>(source.getOwner()) && source.getResultNumber() == 1) {
-          auto [it, inserted] =
-              forwarders.try_emplace(source.getOwner(), "DATA_MOV");
-          if (inserted) {
-            it->second.id = next_id++;
-            it->second.time_step = it->second.index_per_ii = 0;
-            it->second.src_operands.push_back(producer->src_operands.front());
-          }
-          producer = &it->second;
-        }
-        setUniqueDestination(producer, outgoing);
-      }
-    }
-    // Emit in block order for deterministic instruction IDs and output.
-    for (Operation &op : kernel.getBody().front()) {
-      auto it = instructions.find(&op);
-      if (it == instructions.end())
-        continue;
-      auto tile = mapping_utils::getTileLocation(&op);
-      auto &group = tile_time_instructions[{tile.col_idx, tile.row_idx}][0];
-      group.push_back(std::move(it->second));
-      if (auto forward = forwarders.find(&op); forward != forwarders.end())
-        group.push_back(std::move(forward->second));
-    }
-    ArrayConfig config = buildArrayConfig(width.getInt(), height.getInt(), 1);
-    writeYAMLOutput(config);
-    writeAsmOutput(config);
     return success();
+  }
+
+  // Encodes only operands that require launch-time configuration.
+  // Returning false delegates the operation to the existing generic encoder.
+  bool encodeConfiguredOperands(Operation *op, Instruction &instruction,
+                                SmallVectorImpl<Value> &operands) {
+    if (auto mac = dyn_cast<MacOp>(op)) {
+      if (!current_kernel || !stationary_map) {
+        op->emitError("configured MAC is missing kernel metadata");
+        timing_field_error = true;
+        return true;
+      }
+
+      for (Value operand : op->getOperands()) {
+        operands.push_back(operand);
+        instruction.src_operands.emplace_back("UNRESOLVED", "RED");
+      }
+
+      TileLocation tile = getTileLocation(op);
+      auto weights =
+          getConfiguredMemref(current_kernel, stationary_input_index);
+      SmallVector<Attribute> indices;
+      Type index_type = IndexType::get(op->getContext());
+      if (!tile.has_tile || failed(weights) ||
+          failed(stationary_map.getValue().constantFold(
+              {IntegerAttr::get(index_type, tile.col_idx),
+               IntegerAttr::get(index_type, tile.row_idx)},
+              indices)) ||
+          indices.size() != static_cast<size_t>(weights->getRank())) {
+        op->emitError("stationary map cannot resolve this MAC Tile");
+        timing_field_error = true;
+        return true;
+      }
+
+      int64_t offset = 0;
+      for (auto [attribute, size] : llvm::zip(indices, weights->getShape())) {
+        auto index = dyn_cast<IntegerAttr>(attribute);
+        if (!index || index.getInt() < 0 || index.getInt() >= size) {
+          op->emitError("stationary element is outside its memref");
+          timing_field_error = true;
+          return true;
+        }
+        offset = offset * size + index.getInt();
+      }
+
+      operands.insert(operands.begin() + 1, Value());
+      instruction.src_operands.insert(
+          instruction.src_operands.begin() + 1,
+          getConfiguredOperand(stationary_input_index, {offset}, false));
+      return true;
+    }
+
+    if (!isa<LoadOp, StoreOp>(op) || !op->hasAttr("constants")) {
+      return false;
+    }
+
+    auto constants = op->getAttrOfType<DenseI64ArrayAttr>("constants");
+    Value address = isa<LoadOp>(op) ? cast<LoadOp>(op).getAddr()
+                                    : cast<StoreOp>(op).getAddr();
+
+    if (auto store = dyn_cast<StoreOp>(op)) {
+      operands.push_back(store.getValue());
+      instruction.src_operands.emplace_back("UNRESOLVED", "RED");
+    }
+
+    if (!address) {
+      Operand configured_address("#" + std::to_string(constants[0]));
+      configured_address.access = "absolute_address";
+      configured_address.offsets.assign(constants.asArrayRef().begin(),
+                                        constants.asArrayRef().end());
+      operands.push_back(Value());
+      instruction.src_operands.push_back(std::move(configured_address));
+      return true;
+    }
+
+    auto argument = dyn_cast<BlockArgument>(address);
+    if (!current_kernel || !argument ||
+        argument.getOwner() != &current_kernel.getBody().front() ||
+        argument.getArgNumber() >= current_kernel.getInputs().size()) {
+      op->emitError("memref address must be a kernel input block argument");
+      timing_field_error = true;
+      return true;
+    }
+
+    unsigned input_index = argument.getArgNumber();
+    auto memref = getConfiguredMemref(current_kernel, input_index);
+    if (failed(memref)) {
+      op->emitError("memory base requires a static identity-layout i32 "
+                    "memref");
+      timing_field_error = true;
+      return true;
+    }
+
+    for (int64_t offset : constants.asArrayRef()) {
+      if (offset < 0 || offset >= memref->getNumElements()) {
+        op->emitError("constant element offset is out of bounds");
+        timing_field_error = true;
+        return true;
+      }
+    }
+
+    operands.push_back(Value());
+    instruction.src_operands.push_back(
+        getConfiguredOperand(input_index, constants.asArrayRef(), true));
+    return true;
   }
 
   // ---------- entry point ----------.
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    SmallVector<KernelOp> configured;
-    module.walk([&](KernelOp kernel) {
-      bool has_configuration = false;
-      kernel.walk([&](Operation *op) {
-        has_configuration |= isa<MacOp>(op) || op->hasAttr("memory_access");
-      });
-      if (has_configuration)
-        configured.push_back(kernel);
-    });
-    if (!configured.empty()) {
-      if (configured.size() != 1) {
-        module.emitError(
-            "code generation supports one configured kernel per output file");
-        return signalPassFailure();
-      }
-      if (failed(generateConfiguredKernel(configured.front())))
-        signalPassFailure();
-      return;
-    }
 
-    for (auto func : module.getOps<func::FuncOp>()) {
-      auto accel = func->getAttrOfType<StringAttr>(accel::kAcceleratorAttr);
-      if (!accel || accel.getValue() != accel::kNeuraTarget)
-        continue;
-
-      auto [columns, rows] = getArrayDimensions(func);
-      Topology topo = getTopologyFromArchitecture(columns, rows);
-      current_compiled_ii = getCompiledII(func);
-
+    auto generate_for_scope = [&](Operation *scope, func::FuncOp function,
+                                  KernelOp kernel) -> LogicalResult {
       clearState();
+      current_compiled_ii = getCompiledII(scope);
+      if (kernel && failed(configureKernel(kernel))) {
+        return failure();
+      }
 
-      // Single function-level walks: index + materialize + collect.
+      auto [columns, rows] = getArrayDimensions(scope);
+      Topology topology = getTopologyFromArchitecture(columns, rows);
+
       SmallVector<Operation *> data_movs;
       SmallVector<Operation *> ctrl_movs;
       DenseMap<Value, Operation *> reserve_to_phi_map;
-      indexIR(func, data_movs, ctrl_movs, reserve_to_phi_map);
+      indexIR(scope, data_movs, ctrl_movs, reserve_to_phi_map);
+      if (timing_field_error) {
+        return failure();
+      }
 
-      // Expands forwarders without re-walking IR.
-      for (Operation *op : data_movs)
-        expandMovImpl<false>(op, topo, /*unused*/ reserve_to_phi_map);
-      for (Operation *op : ctrl_movs)
-        expandMovImpl<true>(op, topo, reserve_to_phi_map);
+      for (Operation *op : data_movs) {
+        expandMovImpl<false>(op, topology, reserve_to_phi_map);
+      }
+      for (Operation *op : ctrl_movs) {
+        expandMovImpl<true>(op, topology, reserve_to_phi_map);
+      }
       logUnresolvedOperands();
 
       std::unordered_set<int> materialized_ids;
@@ -2573,9 +2558,39 @@ struct GenerateCodePass
       ArrayConfig config = buildArrayConfig(columns, rows, current_compiled_ii);
       writeYAMLOutput(config);
       writeAsmOutput(config);
-      writeDfgOutputSSA(func, topo, materialized_ids);
-      if (timing_field_error)
+      writeDfgOutputSSA(function, topology, materialized_ids);
+      return success(!timing_field_error);
+    };
+
+    SmallVector<KernelOp> mapped_kernels;
+    module.walk([&](KernelOp kernel) {
+      if (kernel->hasAttr(attr::kMappingInfo)) {
+        mapped_kernels.push_back(kernel);
+      }
+    });
+
+    if (!mapped_kernels.empty()) {
+      for (KernelOp kernel : mapped_kernels) {
+        auto function = kernel->getParentOfType<func::FuncOp>();
+        if (!function || failed(generate_for_scope(kernel, function, kernel))) {
+          signalPassFailure();
+          return;
+        }
+      }
+      return;
+    }
+
+    for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      auto accelerator =
+          function->getAttrOfType<StringAttr>(accel::kAcceleratorAttr);
+      if (!accelerator || accelerator.getValue() != accel::kNeuraTarget) {
+        continue;
+      }
+
+      if (failed(generate_for_scope(function, function, KernelOp{}))) {
         signalPassFailure();
+        return;
+      }
     }
   }
 };

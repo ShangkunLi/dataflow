@@ -2,6 +2,7 @@
 
 #include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
+#include "NeuraDialect/NeuraTypes.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -52,6 +53,9 @@ bool validateTemplateOperands(
     if (is_non_materialized(op))
       continue;
     for (Value operand : op->getOperands()) {
+      if (isConfiguredMemrefAddress(op, operand)) {
+        continue;
+      }
       Operation *producer = operand.getDefiningOp();
       if (isa_and_nonnull<ReserveOp>(producer))
         continue;

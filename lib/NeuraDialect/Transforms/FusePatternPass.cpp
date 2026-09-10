@@ -116,8 +116,9 @@ struct FuseGepLoadPattern : public OpRewritePattern<neura::LoadOp> {
                                 PatternRewriter &rewriter) const override {
     Value addr = load.getAddr();
     // Configured loads use a Tile-local address queue.
-    if (!addr)
+    if (!addr || load->hasAttr("constants")) {
       return failure();
+    }
     auto gep_op = addr.getDefiningOp<neura::GEP>();
 
     if (!gep_op)
@@ -151,9 +152,10 @@ struct FuseGepStorePattern : public OpRewritePattern<neura::StoreOp> {
   LogicalResult matchAndRewrite(neura::StoreOp store,
                                 PatternRewriter &rewriter) const override {
     Value addr = store.getAddr();
-    // Configured stores use a Tile-local address queue.
-    if (!addr)
+    // Do not discard the configured offsets when fusing address calculation.
+    if (!addr || store->hasAttr("constants")) {
       return failure();
+    }
     auto gep_op = addr.getDefiningOp<neura::GEP>();
 
     if (!gep_op)

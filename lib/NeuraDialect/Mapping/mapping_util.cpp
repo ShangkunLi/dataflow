@@ -4,6 +4,7 @@
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
+#include "NeuraDialect/NeuraTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
@@ -15,6 +16,25 @@
 
 using namespace mlir;
 using namespace mlir::neura;
+
+bool mlir::neura::isConfiguredMemrefAddress(Operation *op, Value operand) {
+  Value address;
+  if (auto load = dyn_cast<LoadOp>(op)) {
+    address = load.getAddr();
+  }
+  if (auto store = dyn_cast<StoreOp>(op)) {
+    address = store.getAddr();
+  }
+  if (!address || operand != address) {
+    return false;
+  }
+
+  Type type = address.getType();
+  if (auto data = dyn_cast<PredicatedValue>(type)) {
+    type = data.getValueType();
+  }
+  return isa<MemRefType>(type);
+}
 
 // Constants for award calculation.
 constexpr int kAwardProximityScale = 1;
@@ -1010,6 +1030,9 @@ mlir::neura::calculateAward(Operation *op, std::set<Operation *> &critical_ops,
   // Assembles all the producers.
   std::vector<Operation *> producers;
   for (Value operand : op->getOperands()) {
+    if (isConfiguredMemrefAddress(op, operand)) {
+      continue;
+    }
     if (isa<neura::ReserveOp>(operand.getDefiningOp())) {
       // Skips Reserve ops (backward ctrl move) when calculating award.
       continue;
@@ -1258,6 +1281,10 @@ bool mlir::neura::placeAndRoute(Operation *op, const MappingLoc &target_loc,
     std::vector<Operation *> routed_ctrl_movs;
     // Tries to route the data move operations.
     for (Value operand : op->getOperands()) {
+      // Runtime memref bindings consume no Tile-to-Tile routing resource.
+      if (isConfiguredMemrefAddress(op, operand)) {
+        continue;
+      }
       llvm::errs() << "Processing operand: " << operand << "\n";
       if (isa<neura::ReserveOp>(operand.getDefiningOp())) {
         // Skips Reserve ops (backward ctrl move) when routing.

@@ -294,30 +294,59 @@ def Neura_FCmpOp : Op<NeuraDialect, "fcmp"> {
 // Defines a load operation.
 def Neura_LoadOp : Op<NeuraDialect, "load"> {
   let description = [{
-    Loads from a dynamic address, or from a configured address queue.
-    The configured form has no dynamic address operand and carries
-    memory_access = {kernel_input = N : i32, offsets = array<i64: ...>}.
-    Offsets are ordered element offsets relative to the selected kernel
-    memref input, not host pointers or byte addresses. Lowering this configuration
-    requires binding the SRAM base and installing the queue in the memory Tile.
-    Each firing
-    consumes one queue entry; the queue advances on operation completion.
+    Loads values using one of three address forms:
+
+    1. Dynamic address:
+        %value = "neura.load"(%addr) : (i32) -> i32
+
+    2. Memref base with element offsets:
+        %value = "neura.load"(%A) {
+          constants = array<i32: 0, 3, 6>
+        } : (memref<3x3xi32>) -> i32
+
+      The k-th execution reads from base(%A) + constants[k]. The memref is
+      bound at kernel launch and does not consume a data-routing resource.
+
+    3. Absolute addresses:
+        %value = "neura.load"() {
+          constants = array<i32: 32, 35, 38>
+        } : () -> i32
+
+      The k-th execution reads from constants[k].
   }];
   let arguments = (ins Optional<AnyType>:$addr);
   let results = (outs AnyType:$value);
+  let hasVerifier = 1;
   // let assemblyFormat = "$addr `,` attr-dict `:` type($value)";
 }
 
 // Defines a store operation.
 def Neura_StoreOp : Op<NeuraDialect, "store"> {
   let description = [{
-    Stores a flowing value at a dynamic address, or at the next address in a
-    configured memory_access queue. The configured form consumes only value;
-    kernel_input selects the destination memref and offsets lists its ordered
-    element offsets. It uses one memory Tile, without an address-compute Tile.
+    Stores values using one of three address forms. The first operand always
+    provides the value to store.
+
+    1. Dynamic address:
+        "neura.store"(%value, %addr) : (i32, i32) -> ()
+
+    2. Memref base with element offsets:
+        "neura.store"(%value, %C) {
+          constants = array<i32: 0, 3, 6>
+        } : (i32, memref<3x3xi32>) -> ()
+
+      The k-th execution writes to base(%C) + constants[k]. The memref is
+      bound at kernel launch and does not consume a data-routing resource.
+
+    3. Absolute addresses:
+        "neura.store"(%value) {
+          constants = array<i32: 32, 35, 38>
+        } : (i32) -> ()
+
+      The k-th execution writes to constants[k].
   }];
   let arguments = (ins AnyType:$value, Optional<AnyType>:$addr);
   let results = (outs);
+  let hasVerifier = 1;
   // let assemblyFormat = "$value `,` $addr `,` attr-dict";
 }
 

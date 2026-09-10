@@ -1,6 +1,7 @@
 #include "Common/AcceleratorAttrs.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "NeuraDialect/NeuraOps.h"
+#include "NeuraDialect/NeuraTypes.h"
 #include "NeuraDialect/NeuraPasses.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -70,13 +71,36 @@ LogicalResult promoteKernelArgsToConstants(neura::KernelOp kernel_op) {
 
   // Step 1: promotes input arguments (not iter_args).
   // Block arguments layout: [input0, input1, ..., iter_arg0, iter_arg1, ...]
+  auto is_memref_address_use = [](OpOperand &use) {
+    Operation *owner = use.getOwner();
+    Value address;
+    if (auto load = dyn_cast<neura::LoadOp>(owner)) {
+      address = load.getAddr();
+    }
+    if (auto store = dyn_cast<neura::StoreOp>(owner)) {
+      address = store.getAddr();
+    }
+    if (!address || use.get() != address) {
+      return false;
+    }
+
+    Type type = address.getType();
+    if (auto data = dyn_cast<neura::PredicatedValue>(type)) {
+      type = data.getValueType();
+    }
+    return isa<MemRefType>(type);
+  };
+
   for (size_t i = 0; i < num_inputs; ++i) {
     BlockArgument input_arg = args[i];
 
     // Metadata-only inputs do not need a materialized constant operation.
     // For example, a stationary tensor may be referenced by kernel metadata
     // without appearing as an SSA operand in the compute network.
-    if (input_arg.use_empty()) {
+    if (input_arg.use_empty() ||
+        llvm::all_of(input_arg.getUses(), [&](OpOperand &use) {
+          return is_memref_address_use(use);
+        })) {
       continue;
     }
 
